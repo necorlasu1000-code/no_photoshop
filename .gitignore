@@ -1,0 +1,8 @@
+# 화이트리스트 방식: 아래 명시한 파일만 추적 (작업 폴더의 영상/이미지/실험 산출물 제외)
+*
+!.gitignore
+!README.md
+!deband_app.py
+!No photoshop.spec
+!no photoshop.png
+!no_photoshop.ico
