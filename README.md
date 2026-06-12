@@ -4,6 +4,12 @@ AI 생성 이미지·영상의 "AI 티"를 지우는 무설치 후처리 도구.
 
 `No photoshop.exe` 파일 하나만 전달하면 별도 설치 없이 바로 쓸 수 있습니다 (Windows).
 
+## 다운로드
+
+**[⬇ No-photoshop-v0.2.exe](https://github.com/necorlasu1000-code/no_photoshop/releases/download/v0.2/No-photoshop-v0.2.exe)** — 설치 불필요, 다운로드 후 바로 실행 ([전체 릴리스 목록](https://github.com/necorlasu1000-code/no_photoshop/releases))
+
+> 처음 실행 시 Windows SmartScreen 경고가 뜨면 **[추가 정보] → [실행]**을 누르세요 (서명 없는 EXE의 정상 동작입니다).
+
 ## 기능 (ver 0.2)
 
 | 탭 | 설명 | 출력 |
