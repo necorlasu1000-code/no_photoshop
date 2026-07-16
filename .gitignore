@@ -6,3 +6,7 @@
 !No photoshop.spec
 !no photoshop.png
 !no_photoshop.ico
+!depth_extract.py
+!vda/
+!vda/**
+vda/**/__pycache__/

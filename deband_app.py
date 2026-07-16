@@ -15,6 +15,7 @@ import sys
 import queue
 import threading
 import time
+import math
 import traceback
 
 import numpy as np
@@ -23,7 +24,7 @@ import cv2
 EXTS = (".png", ".jpg", ".jpeg", ".webp", ".bmp", ".tif", ".tiff")
 VEXTS = (".mp4", ".mov", ".avi", ".mkv", ".webm")
 APP_TITLE = "no photoshop — 이미지 후처리"
-APP_VER = "ver 0.2"
+APP_VER = "ver 1.2.2"
 
 COL = {
     "bg":     "#0e0f10",
@@ -173,6 +174,477 @@ def deband_video(src, progress=None):
             pass
         proc.wait()
     if proc.returncode != 0:
+        raise RuntimeError("FFmpeg 인코딩 실패")
+    if progress:
+        progress(100)
+    return dst
+
+
+# ---------------- 처리 1c: 영상 스태킹 디밴딩 (진짜 10비트 복원) ----------------
+def _deband_core_float(f):
+    """엣지 게이트 다중스케일 스무딩 (float, 그레인/양자화 없음).
+    스태킹이 못 채운 빠른 모션 영역의 잔여 밴딩 보강용."""
+    scales = [(6, 1.2, 4.0), (16, 1.5, 5.0), (40, 2.0, 6.0), (100, 2.5, 7.0)]
+    for sigma, t_low, t_high in scales:
+        blur = cv2.GaussianBlur(f, (0, 0), sigmaX=sigma, sigmaY=sigma,
+                                borderType=cv2.BORDER_REPLICATE)
+        diff = np.abs(f - blur).max(axis=2)
+        k = max(3, int(sigma // 3) | 1)
+        diff = cv2.dilate(diff, np.ones((k, k), np.uint8))
+        diff = cv2.GaussianBlur(diff, (0, 0), sigmaX=max(2, sigma / 4))
+        t = np.clip((t_high - diff) / (t_high - t_low), 0.0, 1.0)
+        wgt = (t * t * (3 - 2 * t))[..., None]           # smoothstep 게이트
+        f = f * (1 - wgt) + blur * wgt
+    return f
+
+
+def stack_deband_video(src, progress=None, radius=12):
+    """여러 프레임을 옵티컬 플로우로 정렬·모션마스킹 평균해 8비트에서 실제 ~10비트
+    계조를 복원(천체사진 스태킹 원리) → 고주파 디테일 복원 → 잔여 디밴딩 →
+    ProRes 422 HQ .mov(그레이딩 마스터) + HEVC .mp4(미리보기) 출력. 공간 디밴딩과
+    달리 '가리기'가 아니라 실제 정보 복원. 영상 전용 — 프레임 3장 미만이면 폴백."""
+    ff = get_ffmpeg()
+    if not ff:
+        raise RuntimeError("FFmpeg을 찾을 수 없습니다")
+    cap = cv2.VideoCapture(src)
+    if not cap.isOpened():
+        raise RuntimeError("영상을 열 수 없습니다")
+    W = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    H = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    fps = cap.get(cv2.CAP_PROP_FPS) or 24.0
+    frames = []
+    while True:
+        ok, fr = cap.read()
+        if not ok:
+            break
+        frames.append(fr)
+    cap.release()
+    n = len(frames)
+    if n < 3:
+        return deband_video(src, progress=progress)   # 스태킹 불가 → 기존 방식
+    grays = [cv2.cvtColor(f, cv2.COLOR_BGR2GRAY) for f in frames]
+
+    base, _ = os.path.splitext(src)
+    dst = base + "_debanded.mov"          # 그레이딩 마스터 (ProRes 422 HQ, 4:2:2 10비트 인트라)
+    prev = base + "_debanded.mp4"         # 가벼운 미리보기 (HEVC 10비트)
+    flags = 0x08000000 if os.name == "nt" else 0
+
+    def _enc(out, kind):
+        if kind == "prores":
+            vargs = ["-c:v", "prores_ks", "-profile:v", "3",
+                     "-pix_fmt", "yuv422p10le", "-vendor", "apl0"]
+        else:
+            vargs = ["-c:v", "libx265", "-preset", "medium", "-crf", "18",
+                     "-x265-params", "log-level=none",
+                     "-pix_fmt", "yuv420p10le", "-tag:v", "hvc1"]
+        cmd = [ff, "-y",
+               "-f", "rawvideo", "-pix_fmt", "bgr48le", "-s", f"{W}x{H}",
+               "-r", f"{fps}", "-i", "-",
+               "-i", src, "-map", "0:v", "-map", "1:a?", "-c:a", "copy",
+               *vargs,
+               "-color_primaries", "bt709", "-color_trc", "bt709",
+               "-colorspace", "bt709", out]
+        return subprocess.Popen(cmd, stdin=subprocess.PIPE,
+                                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                                creationflags=flags)
+    proc = _enc(dst, "prores")
+    proc_prev = _enc(prev, "hevc")
+
+    SIGMA, DETAIL_SIGMA, DETAIL_W, DITHER = 6.0, 1.6, 0.6, 0.08
+    gx, gy = np.meshgrid(np.arange(W, dtype=np.float32),
+                         np.arange(H, dtype=np.float32))
+    tls = threading.local()
+
+    def get_dis():
+        if not hasattr(tls, "dis"):
+            tls.dis = cv2.DISOpticalFlow_create(cv2.DISOPTICAL_FLOW_PRESET_MEDIUM)
+        return tls.dis
+
+    def stack_one(i):
+        dis = get_dis()
+        cf = frames[i].astype(np.float32)
+        cg = grays[i].astype(np.float32)
+        acc = cf.copy()
+        wsum = np.ones((H, W, 1), np.float32)
+        for j in range(max(0, i - radius), min(n - 1, i + radius) + 1):
+            if j == i:
+                continue
+            flow = dis.calc(grays[i], grays[j], None)
+            mapx = gx + flow[..., 0]
+            mapy = gy + flow[..., 1]
+            warped = cv2.remap(frames[j], mapx, mapy, cv2.INTER_LINEAR,
+                               borderMode=cv2.BORDER_REFLECT)
+            wg = cv2.cvtColor(warped, cv2.COLOR_BGR2GRAY).astype(np.float32)
+            res = np.abs(cv2.GaussianBlur(wg - cg, (5, 5), 0))
+            w = np.exp(-(res / SIGMA) ** 2)[..., None]     # 모션 마스크
+            acc += warped.astype(np.float32) * w
+            wsum += w
+        stacked = acc / wsum
+        # 고주파(텍스처)는 원본에서 복원 — 밴딩은 저주파에만 삼
+        low_s = cv2.GaussianBlur(stacked, (0, 0), DETAIL_SIGMA)
+        low_c = cv2.GaussianBlur(cf, (0, 0), DETAIL_SIGMA)
+        out = low_s + (cf - low_c) * DETAIL_W + (stacked - low_s) * (1.0 - DETAIL_W)
+        out = _deband_core_float(out)                      # 잔여 밴딩 보강
+        rng = np.random.default_rng(777 + i)
+        d = (rng.random((H, W, 1), dtype=np.float32) -
+             rng.random((H, W, 1), dtype=np.float32)) * DITHER   # TPDF 디더
+        out = out + d
+        return i, np.clip(out * 257.0 + 0.5, 0, 65535).astype(np.uint16)
+
+    from multiprocessing.pool import ThreadPool
+    workers = min(16, max(2, (os.cpu_count() or 4) - 2))
+    done = 0
+    try:
+        with ThreadPool(workers) as pool:
+            CH = workers * 2
+            for s in range(0, n, CH):
+                idxs = list(range(s, min(s + CH, n)))
+                for i, out16 in pool.map(stack_one, idxs):
+                    buf = out16.tobytes()
+                    proc.stdin.write(buf)
+                    proc_prev.stdin.write(buf)
+                    done += 1
+                if progress:
+                    progress(min(99, int(done / n * 100)))
+    finally:
+        for p in (proc, proc_prev):
+            try:
+                p.stdin.close()
+            except Exception:
+                pass
+        proc.wait(); proc_prev.wait()
+    if proc.returncode != 0:
+        raise RuntimeError("FFmpeg 인코딩 실패")
+    if progress:
+        progress(100)
+    return dst
+
+
+# ---------------- 처리 1d: 깊이 기반 아웃포커스 (포커싱 탭) ----------------
+DOF_K = 8        # 깊이 슬라이스 수
+DOF_HBOOST = 2.5 # 하이라이트 보케 부스트 최대 강도 (hl 슬라이더로 스케일)
+_DOF_DISC = {}   # 디스크 커널 캐시
+
+
+def _disc_kernel(r, shape="disc"):
+    """조리개 커널 — 실제 렌즈의 착란원. 4× 슈퍼샘플로 0.25px 분수 반지름 +
+    안티앨리어스. shape: disc(원형) | hex(6날) | oct(8날) | ana(아나모픽 타원)."""
+    q = max(1.0, round(float(r) * 4.0) / 4.0)
+    key = (shape, q)
+    k = _DOF_DISC.get(key)
+    if k is None:
+        ri = int(np.ceil(q))
+        ss = 4
+        n = (2 * ri + 1) * ss
+        a = np.zeros((n, n), np.float32)
+        c = ri * ss + ss // 2
+        R = q * ss
+        if shape == "ana":
+            cv2.ellipse(a, (c, c), (int(round(R * 0.72)), int(round(R))),
+                        0, 0, 360, 1.0, -1)
+        elif shape in ("hex", "oct"):
+            nb = 6 if shape == "hex" else 8
+            rot = math.pi / nb                     # 날 살짝 회전
+            pts = np.array([[c + R * math.cos(rot + 2 * math.pi * t / nb),
+                             c + R * math.sin(rot + 2 * math.pi * t / nb)]
+                            for t in range(nb)], np.int32)
+            cv2.fillConvexPoly(a, pts, 1.0)
+        else:
+            cv2.circle(a, (c, c), int(round(R)), 1.0, -1)
+        a = cv2.resize(a, (2 * ri + 1, 2 * ri + 1), interpolation=cv2.INTER_AREA)
+        k = a / a.sum()
+        _DOF_DISC[key] = k
+    return k
+
+
+def _dof_blur(x, r, fast=False, shape="disc"):
+    """디스크(착란원) 블러 — 가우시안의 '안개'가 아니라 렌즈처럼 '겹쳐 번지는' 흐림.
+    큰 반지름은 다운스케일+디스크+업스케일 근사. fast=프리뷰용(더 공격적 근사)."""
+    r = float(r)
+    if r < 0.5:
+        return x
+    if r < 1.5:
+        return cv2.GaussianBlur(x, (0, 0), r * 0.7)
+    direct = 3.0 if fast else 12.0
+    if r <= direct:
+        return cv2.filter2D(x, -1, _disc_kernel(r, shape), borderType=cv2.BORDER_REPLICATE)
+    h, w = x.shape[:2]
+    f = min(8, max(2, int(r / (3 if fast else 8))))
+    sm = cv2.resize(x, (max(8, w // f), max(8, h // f)), interpolation=cv2.INTER_AREA)
+    sm = cv2.filter2D(sm, -1, _disc_kernel(r / f, shape), borderType=cv2.BORDER_REPLICATE)
+    up = cv2.resize(sm, (w, h), interpolation=cv2.INTER_CUBIC)
+    if f >= 3:                       # 업스케일 격자(계단 픽셀) 제거
+        up = cv2.GaussianBlur(up, (0, 0), f * 0.5)
+    return up
+
+
+def dof_dpack(depth01):
+    """뎁스 입력 정규화 — refine-edge 팩 (dhard, dnear, dfar, matte) 그대로,
+    단일 뎁스맵이면 매트 없는 팩으로 감싼다."""
+    if isinstance(depth01, (tuple, list)):
+        return depth01
+    return (depth01, depth01, depth01, None)
+
+
+def dof_slices(img01, depth01, hl=0.0):
+    """깊이 슬라이스 분해 — 초점·조리개와 무관해서 프레임별 캐시 가능.
+    depth01: 단일 뎁스맵 또는 refine-edge 팩 (dhard, dnear, dfar, matte 0..1).
+    매트가 있으면 경계 밴드 픽셀(털 가닥 등)을 M 비율로 전경/배경 깊이에
+    이중 소속시킨다 — 곡선 마스크가 아니라 refine-edge식 소프트 매팅.
+    hl: 보케 하이라이트 0..1. 0이면 감마 공간 그대로 블러(색 100% 보존).
+    반환: (슬라이스 리스트[(중심깊이, 대표깊이, 색*α, 부스트색*α, α)] far→near,
+           경계존 맵, 작업공간 원본, 감마 플래그)."""
+    dhard, dnear, dfar, M = dof_dpack(depth01)
+    if hl > 0.0:
+        lin = img01 * img01                              # 감마2 근사 리니어
+        lum = lin.max(axis=2)
+        hb = (1.0 + DOF_HBOOST * hl *
+              np.clip((lum - 0.55) / 0.45, 0.0, 1.0) ** 2)[..., None]
+        linb = lin * hb
+        gam = True
+    else:
+        lin = img01                                      # 색 보존: 표시 공간 그대로
+        linb = lin
+        gam = False
+    dn = np.clip(dnear.astype(np.float32), 0.5 / DOF_K, 1 - 0.5 / DOF_K)
+    if M is None:
+        df, Mw, Mi = dn, None, None
+    else:
+        df = np.clip(dfar.astype(np.float32), 0.5 / DOF_K, 1 - 0.5 / DOF_K)
+        Mw = M.astype(np.float32)
+        # 매트 리맵: 거의 순수한 배경 픽셀(Mi>0.7)만 배경 소속을 유지하고 혼합
+        # 링은 피사체를 따라가게 — 후경 초점 시 혼합색의 배경 몫이 선명하게
+        # 렌더되어 남던 '원본 외곽 잔상'이 피사체와 함께 뭉개진다 (test4 검증).
+        _mi = 1.0 - Mw
+        Mw = 1.0 - _mi * np.clip((_mi - 0.4) / 0.3, 0.0, 1.0)
+        Mi = 1.0 - Mw
+    # 적응형 슬라이스: 중심을 균일 격자가 아닌 '콘텐츠 깊이 분위수'에 배치 —
+    # 피사체가 몰린 깊이 구간에 슬라이스가 집중되어 몸 안 부위(머리/팔/해머)가
+    # 서로 다른 슬라이스로 분리, 실제 렌즈처럼 초점면이 공간을 훑는 느낌이 생긴다.
+    cs = np.quantile(dn, np.linspace(0.001, 0.999, DOF_K)).astype(np.float64)
+    for _i in range(1, DOF_K):
+        cs[_i] = max(cs[_i], cs[_i - 1] + 0.015)
+    cs = np.clip(cs, 0.0, 1.0)
+    _gL = [1e9] + [max(cs[_i] - cs[_i - 1], 1e-6) for _i in range(1, DOF_K)]
+    _gR = [max(cs[_i + 1] - cs[_i], 1e-6) for _i in range(DOF_K - 1)] + [1e9]
+
+    def _w(dv, k):
+        lo = np.clip((cs[k] - dv) / _gL[k], 0.0, None)
+        hi = np.clip((dv - cs[k]) / _gR[k], 0.0, None)
+        return np.clip(1.0 - np.maximum(lo, hi), 0.0, 1.0)
+    out = []
+    for k in range(DOF_K):
+        c = float(cs[k])
+        if M is None:
+            m = _w(dn, k)
+            num = None
+        else:
+            m1 = Mw * _w(dn, k)
+            m2 = Mi * _w(df, k)
+            m = m1 + m2
+            num = m1 * dn + m2 * df
+        ms = float(m.sum())
+        if ms < 1e-3:
+            continue
+        # 블러 반지름용 대표 깊이 = 내용물의 실제 평균 깊이 (슬라이스 중심이 아니라).
+        # 중심값을 쓰면 초점이 각 슬라이스 중심을 지날 때마다 배경이 번갈아
+        # '완전 선명'으로 튀어 엣지 밝기가 맥동(깜빡임)한다.
+        dm = float(((m * dn) if num is None else num).sum() / ms)
+        m3 = m[..., None]
+        pm = lin * m3
+        out.append((c, dm, pm, pm if not gam else linb * m3, m))
+    k5 = np.ones((5, 5), np.uint8)
+    e = cv2.dilate(dhard, k5) - cv2.erode(dhard, k5)
+    edge = cv2.GaussianBlur(np.clip((e - 0.05) / 0.10, 0.0, 1.0), (0, 0), 1.5)
+    return out, edge, lin, gam
+
+
+def dof_apply(img01, depth01, focus, aperture_px, slices=None, fast=False, hl=0.0,
+              shape="disc", ca=0.0, breath=0.0):
+    """뎁스 기반 피사계 심도 — 레이어드 합성(Nuke ZDefocus 계열) + 디스크 보케.
+    2패스: ①초점 이하(원경~초점면) 슬라이스 합성 → 초점면 원본 복원(경계존 보호)
+    → ②전경 슬라이스를 그 위에 오버 합성. 복원이 전경 스필보다 먼저라 흐린
+    전경이 선명한 배경 위로 온전히 반투명하게 번짐(스필 감쇠 버그 없음).
+    hl=0이면 색 100% 보존, >0이면 리니어+하이라이트 부스트(보케 볼).
+    img01: float32 HxWx3 (0-1, BGR) · depth01: 0-1 (1=가까움) · aperture_px: 최대 반지름."""
+    if aperture_px < 0.6:
+        return img01
+    if slices is None:
+        slices = dof_slices(img01, depth01, hl)
+    sl, edge, lin, gam = slices
+
+    def blur_slice(dm, pm, pmb, m):
+        s = abs(dm - focus) * aperture_px                # 대표 깊이 기반 — 데드존 없음
+        if s < 0.5:
+            return pm, m
+        t = min(1.0, max(0.0, (s - 1.0) / 3.0))          # 흐린 슬라이스만 부스트 (연속 램프)
+        src = pm if (not gam or t <= 0) else (pmb if t >= 1 else pm + (pmb - pm) * t)
+        if ca > 0.0 and s >= 2.0:
+            # 축상 색수차: 후경 보케=그린이 크게, 전경 보케=마젠타(R/B)가 크게
+            k = 0.10 * ca
+            if dm < focus:
+                rG, rRB = s * (1.0 + k), s * (1.0 - 0.5 * k)
+            else:
+                rG, rRB = s * (1.0 - 0.5 * k), s * (1.0 + k)
+            b_, g_, r_ = cv2.split(src)
+            bpm = cv2.merge([_dof_blur(b_, rRB, fast, shape),
+                             _dof_blur(g_, rG, fast, shape),
+                             _dof_blur(r_, rRB, fast, shape)])
+            return bpm, _dof_blur(m, s, fast, shape)
+        return _dof_blur(src, s, fast, shape), _dof_blur(m, s, fast, shape)
+
+    acc = cov = accN = covN = None
+    for c, dm, pm, pmb, m in sl:
+        # 소프트 패스 분할: 초점보다 한 슬라이스 이상 가까우면 전경(nw=1),
+        # 경계 슬라이스는 비율로 양쪽에 — 초점 이동 시 합성 방식이 뚝 안 바뀜
+        nw = min(1.0, max(0.0, (dm - focus) * DOF_K - 0.5))
+        bpm, ba = blur_slice(dm, pm, pmb, m)
+        if nw < 1.0:                 # ① 원경~초점면: 오버 합성 후 정규화
+            f = 1.0 - nw
+            bp, bb = (bpm, ba) if nw <= 0.0 else (bpm * f, ba * f)
+            if acc is None:
+                acc, cov = bp.copy(), bb.copy()
+            else:
+                ia = 1.0 - bb
+                np.multiply(acc, ia[..., None], out=acc)
+                np.add(acc, bp, out=acc)
+                np.multiply(cov, ia, out=cov)
+                np.add(cov, bb, out=cov)
+        if nw > 0.0:                 # ② 전경: 가산 파티션 (내부 색 보존)
+            bp, bb = (bpm, ba) if nw >= 1.0 else (bpm * nw, ba * nw)
+            if accN is None:
+                accN, covN = bp.copy(), bb.copy()
+            else:
+                np.add(accN, bp, out=accN)
+                np.add(covN, bb, out=covN)
+    # 배경(패스1)을 '완전 커버리지'로 만든 뒤 전경을 얹는다. 커버리지 구멍을
+    # 나눗셈으로 때우면 그 나눗셈이 증폭기가 되어 초점 이동 시 밝기 맥동(깜빡임)이
+    # 생기므로, 구멍(전경에 가려진 배경)은 주변 배경색 외삽으로 채운다.
+    if acc is None:
+        acc = lin.copy()
+    else:
+        colorB = acc / np.maximum(cov, 1e-6)[..., None]
+        np.clip(colorB, 0.0, 1.0, out=colorB)
+        covB = np.clip(cov * 1.3, 0.0, 1.0)   # 인접 슬라이스 오버합성 결손(≈0.77) 보정
+        acc = colorB * covB[..., None]
+        r_fill = max(3.0, aperture_px * 0.5)
+        fill = (_dof_blur(acc, r_fill, True) /
+                np.maximum(_dof_blur(covB, r_fill, True), 1e-4)[..., None])
+        np.clip(fill, 0.0, 1.0, out=fill)
+        acc += fill * (1.0 - covB)[..., None]  # 가려진 배경 = 주변 배경 외삽
+    dh_, dnr_, dfr_, M_ = dof_dpack(depth01)
+    if M_ is None:
+        # 단일 뎁스: 경계 램프의 중간 깊이가 초점으로 오인될 수 있어 경계존 가드 필요
+        wd = np.clip(1.0 - np.abs(dnr_ - focus) * aperture_px / 1.6, 0.0, 1.0) * (1.0 - edge)
+    else:
+        # 매트 팩: 근경(피사체) 쪽 초점 근접도 × M 만으로 복원. 초점 맞은 피사체
+        # 실루엣은 (시간적으로 안정적인) 원본으로 고정되어 경계 깜빡임이 없고,
+        # 원경이 초점일 때는 복원하지 않는다 — 원본에는 선명한 피사체 엣지가 섞여
+        # 있어서 원경 가중으로 복원하면 흐린 피사체 위에 실루엣 선이 재주입된다.
+        # (원경의 선명함은 패스1 합성이 이미 올바르게 렌더함)
+        wd = M_ * np.clip(1.0 - np.abs(dnr_ - focus) * aperture_px / 1.6, 0.0, 1.0)
+    w = wd[..., None]                # 초점면 원본 복원
+    np.multiply(acc, 1.0 - w, out=acc)
+    acc += lin * w
+    if accN is not None:             # 전경을 복원된 배경 위로: out = FG + BG*(1-α)
+        sc = np.maximum(covN, 1.0)   # 겹친 스필만 눌러줌 (파티션 합=1은 그대로)
+        np.divide(accN, sc[..., None], out=accN)
+        np.minimum(covN, 1.0, out=covN)
+        np.multiply(acc, (1.0 - covN)[..., None], out=acc)
+        np.add(acc, accN, out=acc)
+    np.clip(acc, 0.0, 1.0, out=acc)
+    if gam:
+        np.sqrt(acc, out=acc)
+    # 오클루전 엣지 일관성 패스: 실루엣 밴드의 선명도 상한 = 피사체(근경) 블러.
+    # 매트 밖까지 새어 있는 피사체 색(AA 헤일로·림 글로우)이 배경 초점에서
+    # 선명한 외곽선으로 남는 것을, 색 추정 없이 밴드 재블러로 봉쇄한다.
+    # (밴드·게이트 모두 넓게 스무딩 — 급한 전이는 그 자체가 새 경계를 만든다)
+    if M_ is not None:
+        tz = np.maximum(((M_ > 0.02) & (M_ < 0.98)).astype(np.float32), edge)
+        band = np.clip(cv2.GaussianBlur(tz, (0, 0), 6.0) * 1.6, 0.0, 0.9)
+        rr = np.abs(dnr_ - focus) * aperture_px
+        rgate = cv2.GaussianBlur(np.clip((rr - 1.0) / 3.0, 0.0, 1.0), (0, 0), 5.0)
+        w3 = band * rgate
+        if float(w3.max()) > 0.05:
+            rmed = float(np.median(rr[w3 > 0.05]))
+            if rmed >= 1.0:
+                bl = _dof_blur(acc, rmed, fast)
+                w3 = w3[..., None]
+                acc = acc * (1.0 - w3) + bl * w3
+    if breath > 0.0:
+        # 포커스 브리딩: 근접 초점일수록 미세 줌 (최대 ±1.5%) — 렌즈 손맛
+        sc = 1.0 + 0.015 * breath * (focus - 0.5) * 2.0
+        h_, w_ = acc.shape[:2]
+        Mw_ = cv2.getRotationMatrix2D((w_ / 2.0, h_ / 2.0), 0.0, sc)
+        acc = cv2.warpAffine(acc, Mw_, (w_, h_), flags=cv2.INTER_LINEAR,
+                             borderMode=cv2.BORDER_REPLICATE)
+    return acc
+
+
+def focus_render_video(frames, depth16, focus_curve, aperture_frac, fps, src,
+                       progress=None, hl=0.0, shape="disc", ca=0.0, breath=0.0):
+    """녹화된 포커스 커브(프레임별 초점 뎁스)로 전체 영상에 DoF를 구워
+    ProRes .mov(마스터) + HEVC .mp4(미리보기) 출력."""
+    ff = get_ffmpeg()
+    if not ff:
+        raise RuntimeError("FFmpeg을 찾을 수 없습니다")
+    H, W = frames[0].shape[:2]
+    N = len(frames)
+    base, _ = os.path.splitext(src)
+    dst = base + "_focus.mov"
+    prev = base + "_focus.mp4"
+    flags = 0x08000000 if os.name == "nt" else 0
+
+    def _enc(out, kind):
+        if kind == "prores":
+            vargs = ["-c:v", "prores_ks", "-profile:v", "3",
+                     "-pix_fmt", "yuv422p10le", "-vendor", "apl0"]
+        else:
+            vargs = ["-c:v", "libx265", "-preset", "medium", "-crf", "18",
+                     "-x265-params", "log-level=none", "-pix_fmt", "yuv420p10le", "-tag:v", "hvc1"]
+        cmd = [ff, "-y", "-f", "rawvideo", "-pix_fmt", "bgr48le", "-s", f"{W}x{H}",
+               "-r", f"{fps}", "-i", "-", "-i", src, "-map", "0:v", "-map", "1:a?", "-c:a", "copy",
+               *vargs, "-color_primaries", "bt709", "-color_trc", "bt709", "-colorspace", "bt709", out]
+        return subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL,
+                                stderr=subprocess.DEVNULL, creationflags=flags)
+    p = _enc(dst, "prores"); pp = _enc(prev, "hevc")
+    d16, dn16, df16, mt8 = depth16 if isinstance(depth16, tuple) else (depth16, None, None, None)
+    ap_arr = hasattr(aperture_frac, "__len__")
+
+    def _one(i):
+        img = frames[i].astype(np.float32) / 255.0
+        if mt8 is None:
+            dep = d16[i].astype(np.float32) / 65535.0
+        else:
+            dep = (d16[i].astype(np.float32) / 65535.0,
+                   dn16[i].astype(np.float32) / 65535.0,
+                   df16[i].astype(np.float32) / 65535.0,
+                   mt8[i].astype(np.float32) / 255.0)
+        af = float(aperture_frac[i]) if ap_arr else float(aperture_frac)
+        out = dof_apply(img, dep, float(focus_curve[i]), af * W, hl=hl,
+                        shape=shape, ca=ca, breath=breath)
+        return np.clip(out * 65535.0 + 0.5, 0, 65535).astype(np.uint16).tobytes()
+
+    from multiprocessing.pool import ThreadPool
+    workers = min(8, max(2, (os.cpu_count() or 4) - 2))
+    try:
+        done = 0
+        with ThreadPool(workers) as pool:
+            CH = workers * 2
+            for s0 in range(0, N, CH):
+                for buf in pool.map(_one, range(s0, min(s0 + CH, N))):
+                    p.stdin.write(buf); pp.stdin.write(buf)
+                    done += 1
+                if progress:
+                    progress(min(99, int(done / N * 100)))
+    finally:
+        for q in (p, pp):
+            try:
+                q.stdin.close()
+            except Exception:
+                pass
+        p.wait(); pp.wait()
+    if p.returncode != 0:
         raise RuntimeError("FFmpeg 인코딩 실패")
     if progress:
         progress(100)
@@ -885,8 +1357,8 @@ def run_gui(initial_files):
     tabbar.pack(fill="x", padx=24, pady=(18, 0))
     pages = {}
     current = {"idx": 0}
-    TABS = ["밴딩 제거", "실사 질감", "Remove GPT", "우글거림 수정", "디테일 보강"]
-    TAB_W, TAB_H, PILL_PAD = 122, 40, 4
+    TABS = ["밴딩 제거", "실사 질감", "Remove GPT", "우글거림 수정", "디테일 보강", "포커싱"]
+    TAB_W, TAB_H, PILL_PAD = 106, 40, 4
 
     def draw_tabs(_=None):
         tabbar.delete("all")
@@ -1191,7 +1663,7 @@ def run_gui(initial_files):
                         root.after(0, pbar.set_frac, frac)
                     root.after(0, set_status, f"처리 중: {name} · 대기 {jobs.qsize()}장")
                     if p.lower().endswith(VEXTS):
-                        dst = deband_video(p, progress=prog)
+                        dst = stack_deband_video(p, progress=prog)
                     else:
                         dst = process_file(p, fn, suffix, progress=prog)
                     counter["done"] += 1
@@ -2632,13 +3104,905 @@ def run_gui(initial_files):
         page.add_files = add_files
         return page
 
+    def build_focus_page():
+        import math
+        page = tk.Frame(body, bg=COL["bg"])
+        page.place(x=0, y=0, relwidth=1, relheight=1)
+        S = {"frames": None, "pv": None, "depth16": None, "pvd": None,
+             "N": 0, "W": 0, "H": 0, "fps": 24.0, "pw": 0, "ph": 0,
+             "focus": 0.5, "ap": 22.0, "cur": 0, "playing": False, "recording": False,
+             "fc": None, "recmask": None, "src": None, "photo": None, "busy": False,
+             "last_ang": None, "stk": None, "stk_key": None, "rq": False,
+             "mag": None, "magcv": None, "magphoto": None, "view": None,
+             "mx": 320, "my": 180, "hl": 0.0, "ftg": 0.5, "tw": False, "marks": {},
+             "glide": None, "cnt": None, "keys": [], "akeys": [], "gch": "f",
+             "lshape": "disc", "lca": 0.30, "lbr": 0.40}
+
+        wrap = tk.Frame(page, bg=COL["bg"])
+        wrap.pack(fill="both", expand=True, padx=22, pady=14)
+
+        hint = tk.Label(wrap, justify="left", bg=COL["bg"], fg=COL["sub"], font=(FONT, 10),
+                        text="영상을 넣으면 깊이를 인식해요. 휠(마우스 휠)로 초점을 당기고, 조리개로 "
+                             "심도를 조절하세요. [녹화] 켜고 재생하며 포커스 풀 → [렌더]로 구워냅니다. "
+                             "Tab: ×10 돋보기 · 1~4: 감도 기어 · Space: 재생/정지 · "
+                             "Q/W/E/R: 포커스 마커(첫입력=찍기, 재입력=이동, Shift=다시찍기, Ctrl=삭제) · A/D: 조리개")
+        hint.pack(anchor="w", pady=(0, 8))
+
+        top = tk.Frame(wrap, bg=COL["bg"]); top.pack(fill="x")
+        status = tk.Label(top, text="영상을 드래그하거나 [영상 열기]", bg=COL["bg"],
+                          fg=COL["dim"], font=(MONO, 10)); status.pack(side="left")
+
+        main = tk.Frame(wrap, bg=COL["bg"]); main.pack(fill="both", expand=True, pady=10)
+        PVW = 640
+        prev_cv = tk.Canvas(main, width=PVW, height=int(PVW * 9 / 16), bg="#0a0b0c",
+                            highlightthickness=1, highlightbackground=COL["border"])
+        prev_cv.pack(side="left")
+        ctrl = tk.Frame(main, bg=COL["bg"]); ctrl.pack(side="left", fill="y", padx=(18, 0))
+
+        # ---- 포커스 휠 ----
+        tk.Label(ctrl, text="FOCUS", bg=COL["bg"], fg=COL["sub"],
+                 font=(FONT, 10, "bold")).pack(anchor="w")
+        WHEEL = 168
+        wheel = tk.Canvas(ctrl, width=WHEEL, height=WHEEL, bg=COL["bg"],
+                          highlightthickness=0, cursor="hand2"); wheel.pack(pady=(4, 2))
+        fval = tk.Label(ctrl, text="초점 —", bg=COL["bg"], fg=COL["lime"],
+                        font=(MONO, 11)); fval.pack()
+
+        def draw_wheel():
+            wheel.delete("all")
+            c = WHEEL / 2; R = c - 10
+            wheel.create_oval(c - R, c - R, c + R, c + R, outline=COL["border"], width=2)
+            wheel.create_oval(c - R + 14, c - R + 14, c + R - 14, c + R - 14,
+                              outline=COL["dash"], width=1)
+            for k in range(24):
+                a = math.radians(k * 15)
+                r0 = R - 3 if k % 6 else R - 9
+                wheel.create_line(c + r0 * math.cos(a), c + r0 * math.sin(a),
+                                  c + R * math.cos(a), c + R * math.sin(a),
+                                  fill=COL["dim"], width=1)
+            for ch, fv in S["marks"].items():              # 포커스 마커 (테이프)
+                mcol = MARKC.get(ch, COL["lime"])
+                ma = math.radians(-215 + fv * 250)
+                wheel.create_line(c + (R - 8) * math.cos(ma), c + (R - 8) * math.sin(ma),
+                                  c + (R + 6) * math.cos(ma), c + (R + 6) * math.sin(ma),
+                                  fill=mcol, width=3)
+                wheel.create_text(c + (R - 19) * math.cos(ma), c + (R - 19) * math.sin(ma),
+                                  text=ch.upper(), fill=mcol, font=(MONO, 8, "bold"))
+            ang = math.radians(-215 + S["ftg"] * 250)     # 250도 스윕 (목표값 즉시 반영)
+            wheel.create_line(c, c, c + (R - 16) * math.cos(ang), c + (R - 16) * math.sin(ang),
+                              fill=COL["lime"], width=3)
+            wheel.create_oval(c + (R - 16) * math.cos(ang) - 6, c + (R - 16) * math.sin(ang) - 6,
+                              c + (R - 16) * math.cos(ang) + 6, c + (R - 16) * math.sin(ang) + 6,
+                              fill=COL["lime"], outline="")
+            wheel.create_oval(c - 5, c - 5, c + 5, c + 5, fill=COL["sub"], outline="")
+
+        def tween_tick():
+            """포커스가 목표값(ftg)으로 관성 있게 따라감 — 시간 기반 지수 감쇠라
+            렌더가 느려도 벽시계 기준 등속(끊김 없음)이고, 통과 속도가 느려져
+            초점면을 지날 때의 플래시('갔다 돌아오는 느낌')가 여러 프레임에 퍼진다."""
+            now = time.perf_counter()
+            dt = min(0.1, now - S.get("tw_t", now - 0.03))
+            S["tw_t"] = now
+            g = S["glide"]
+            if g is not None:                  # 마커 랙: 스무스스텝 글라이드 (가속-순항-감속)
+                f0, f1, t0, dur = g
+                p = min(1.0, (now - t0) / dur)
+                S["focus"] = f0 + (f1 - f0) * p * p * (3.0 - 2.0 * p)
+                if p >= 1.0:
+                    S["glide"] = None
+                    S["tw"] = abs(S["ftg"] - S["focus"]) >= 0.002
+                    if S["recording"]:
+                        add_key(S["cur"], S["focus"])   # 랙 도착 키프레임
+            else:
+                d = S["ftg"] - S["focus"]
+                if abs(d) < 0.002:
+                    S["focus"] = S["ftg"]
+                    S["tw"] = False
+                else:
+                    S["focus"] += d * (1.0 - math.exp(-dt / 0.18))
+            if S["recording"] and S["fc"] is not None:
+                S["fc"][S["cur"]] = S["focus"]; S["recmask"][S["cur"]] = True
+            request_render()
+            if S["tw"]:
+                root.after(30, tween_tick)
+
+        def set_focus(f):
+            S["glide"] = None                  # 휠 개입 시 마커 글라이드 즉시 해제
+            S["ftg"] = max(0.0, min(1.0, f))
+            near = S["ftg"]
+            fval.configure(text=f"초점 {near*100:4.0f}%  ({'가까움' if near>0.6 else '멀리' if near<0.4 else '중간'})")
+            draw_wheel()
+            if not S["tw"]:
+                S["tw"] = True
+                tween_tick()
+
+        def wheel_drag(e):
+            c = WHEEL / 2
+            ang = math.degrees(math.atan2(e.y - c, e.x - c))
+            if S["last_ang"] is not None:
+                d = ang - S["last_ang"]
+                if d > 180: d -= 360
+                if d < -180: d += 360
+                set_focus(S["ftg"] + d / 250.0)
+            S["last_ang"] = ang
+
+        def wheel_release(_):
+            S["last_ang"] = None
+        wheel.bind("<Button-1>", lambda e: (wheel.focus_set(), wheel_drag(e)))
+        wheel.bind("<B1-Motion>", wheel_drag)
+        wheel.bind("<ButtonRelease-1>", wheel_release)
+
+        # ---- 휠 감도 ----
+        sens_var = tk.DoubleVar(value=3.0)   # 휠 한 칸당 초점 이동 % (20이면 한 번 휙에 끝↔끝)
+        tk.Label(ctrl, text="휠 감도", bg=COL["bg"], fg=COL["sub"],
+                 font=(FONT, 10, "bold")).pack(anchor="w", pady=(8, 0))
+        tk.Scale(ctrl, from_=1, to=20, resolution=0.5, orient="horizontal",
+                 variable=sens_var, showvalue=True, length=168, bg=COL["card"],
+                 fg=COL["text"], troughcolor=COL["card2"], highlightthickness=0,
+                 bd=0, font=(MONO, 8)).pack()
+        tk.Label(ctrl, text="← 미세 조절          한 번에 휙 →", bg=COL["bg"],
+                 fg=COL["dim"], font=(MONO, 8)).pack()
+
+        def on_scroll(e):
+            notches = e.delta / 120.0        # 고해상도 휠·트랙패드도 비례 반영
+            set_focus(S["ftg"] + notches * sens_var.get() / 100.0)
+            return "break"
+        for w in (prev_cv, wheel):
+            w.bind("<MouseWheel>", on_scroll)
+
+        # ---- 조리개 ----
+        tk.Label(ctrl, text="APERTURE (심도)", bg=COL["bg"], fg=COL["sub"],
+                 font=(FONT, 10, "bold")).pack(anchor="w", pady=(12, 0))
+        ap_var = tk.DoubleVar(value=S["ap"])
+
+        def on_ap(v):
+            S["ap"] = float(v); request_render()
+        ap_scale = tk.Scale(ctrl, from_=0, to=100, orient="horizontal", variable=ap_var,
+                            command=on_ap, showvalue=True, length=168, bg=COL["card"],
+                            fg=COL["text"], troughcolor=COL["card2"], highlightthickness=0,
+                            bd=0, font=(MONO, 8)); ap_scale.pack()
+        tk.Label(ctrl, text="← 깊은 심도        얕은 심도(보케) →", bg=COL["bg"],
+                 fg=COL["dim"], font=(MONO, 8)).pack()
+
+        # ---- 보케 하이라이트 (광원용, 0=색 그대로) ----
+        tk.Label(ctrl, text="보케 하이라이트", bg=COL["bg"], fg=COL["sub"],
+                 font=(FONT, 10, "bold")).pack(anchor="w", pady=(8, 0))
+        hl_var = tk.DoubleVar(value=0.0)
+
+        def on_hl(v):
+            S["hl"] = float(v) / 100.0
+            S["stk_key"] = None                # 작업공간 바뀜 → 슬라이스 캐시 무효화
+            request_render()
+        tk.Scale(ctrl, from_=0, to=100, orient="horizontal", variable=hl_var,
+                 command=on_hl, showvalue=True, length=168, bg=COL["card"],
+                 fg=COL["text"], troughcolor=COL["card2"], highlightthickness=0,
+                 bd=0, font=(MONO, 8)).pack()
+        tk.Label(ctrl, text="0 = 색 보존 · 광원 장면만 올리기", bg=COL["bg"],
+                 fg=COL["dim"], font=(MONO, 8)).pack()
+
+        # ---- 녹화 / 렌더 버튼 ----
+        btns = tk.Frame(ctrl, bg=COL["bg"]); btns.pack(pady=(16, 0))
+        lamp = tk.Canvas(btns, width=14, height=34, bg=COL["bg"], highlightthickness=0)
+        lamp.pack(side="left")
+        lamp_id = lamp.create_oval(2, 13, 12, 23, fill=COL["card2"], outline=COL["border"])
+
+        def set_lamp(color):
+            lamp.itemconfigure(lamp_id, fill=color)
+        rec_btn = canvas_button(btns, "● 녹화", 80, 34, primary=False)
+        rec_btn.pack(side="left", padx=(0, 6))
+        render_btn = canvas_button(btns, "렌더", 80, 34, primary=True)
+        render_btn.pack(side="left")
+
+        def _cnt_tick():
+            """3-2-1 카운트 — 손 준비 시간. 카운트 동안은 recording=False라
+            초점 조작이 커브에 스탬프되지 않는다(구울 영상에 미포함)."""
+            if not S["cnt"]:
+                return
+            prev_cv.delete("cntdown")
+            prev_cv.create_text(PVW / 2, S["ph"] / 2, text=str(S["cnt"]),
+                                fill="#ff5252", font=(FONT, 64, "bold"), tags="cntdown")
+            rec_btn.set_text(f"●  {S['cnt']} ")
+
+            def nxt():
+                if not S["cnt"]:
+                    return
+                S["cnt"] -= 1
+                if S["cnt"] <= 0:
+                    S["cnt"] = None
+                    prev_cv.delete("cntdown")
+                    S["cur"] = 0; pos_var.set(0)   # 한 테이크 = 0프레임부터 전체
+                    S["recording"] = True
+                    S["keys"] = [{"f": 0, "v": float(S["ftg"])}]
+                    rec_btn.set_text("■ REC")
+                    set_lamp("#ff3b30")            # 빨간불
+                    set_focus(S["ftg"])            # 시작 프레임 스탬프
+                    if not S["playing"]:
+                        toggle_play()              # 자동 재생
+                else:
+                    _cnt_tick()
+            root.after(1000, nxt)
+
+        def toggle_rec():
+            if S["frames"] is None:
+                return
+            if S["cnt"]:                           # 카운트 중 재클릭 = 취소
+                S["cnt"] = None
+                prev_cv.delete("cntdown")
+                rec_btn.set_text("● 녹화")
+                set_lamp(COL["card2"])
+                return
+            if S["recording"]:                     # 녹화 종료
+                S["recording"] = False
+                rec_btn.set_text("● 녹화")
+                set_lamp(COL["card2"])
+                return
+            S["cnt"] = 3                           # 3-2-1 후 녹화+재생 시작
+            set_lamp("#ffd93d")
+            _cnt_tick()
+        rec_btn.bind("<Button-1>", lambda e: toggle_rec())
+
+        # ---- 타임라인 / 재생 ----
+        tl = tk.Frame(wrap, bg=COL["bg"]); tl.pack(fill="x", pady=(8, 0))
+        play_btn = canvas_button(tl, "▶", 40, 30, primary=False); play_btn.pack(side="left")
+        pos_var = tk.IntVar(value=0)
+
+        def on_scrub(v):
+            if S["frames"] is None:
+                return
+            S["cur"] = int(float(v))
+            if S["recording"]:
+                S["fc"][S["cur"]] = S["focus"]; S["recmask"][S["cur"]] = True
+            request_render()
+        tl_scale = tk.Scale(tl, from_=0, to=0, orient="horizontal", variable=pos_var,
+                            command=on_scrub, showvalue=False, length=560, bg=COL["card"],
+                            fg=COL["text"], troughcolor=COL["card2"], highlightthickness=0,
+                            bd=0); tl_scale.pack(side="left", fill="x", expand=True, padx=8)
+        frm_lbl = tk.Label(tl, text="0/0", bg=COL["bg"], fg=COL["dim"],
+                           font=(MONO, 9)); frm_lbl.pack(side="left")
+
+        # ---- 포커스/조리개 그래프 (프리미어식 키프레임 에디터) ----
+        GPAD = 14
+        grow = tk.Frame(wrap, bg=COL["bg"]); grow.pack(fill="x", pady=(6, 0))
+        gch_btn = canvas_button(grow, "초점", 64, 26, primary=False)
+        gch_btn.pack(side="left", padx=(0, 6), anchor="n")
+
+        def toggle_gch():
+            S["gch"] = "a" if S["gch"] == "f" else "f"
+            gch_btn.set_text("초점" if S["gch"] == "f" else "조리개")
+            draw_graph()
+        gch_btn.bind("<Button-1>", lambda e: toggle_gch())
+        graph = tk.Canvas(grow, height=90, bg="#0a0b0c", highlightthickness=1,
+                          highlightbackground=COL["border"])
+        graph.pack(side="left", fill="x", expand=True)
+        gdrag = {"i": None}
+
+        def ap_curve():
+            """조리개 커브 (0..100). akeys 없으면 슬라이더 상수."""
+            if not S["akeys"]:
+                return np.full(S["N"], S["ap"], np.float32)
+            ks = S["akeys"]
+            arr = np.full(S["N"], ks[0]["v"], np.float32)
+            for a, b in zip(ks[:-1], ks[1:]):
+                if b["f"] > a["f"]:
+                    t = np.linspace(0.0, 1.0, b["f"] - a["f"] + 1)
+                    arr[a["f"]:b["f"] + 1] = a["v"] + (b["v"] - a["v"]) * (t * t * (3 - 2 * t))
+            arr[ks[-1]["f"]:] = ks[-1]["v"]
+            return arr
+
+        def cur_curve():
+            if S["recmask"] is not None and S["recmask"].any():
+                idx = np.where(S["recmask"])[0]
+                return np.interp(np.arange(S["N"]), idx, S["fc"][idx]).astype(np.float32)
+            return np.full(S["N"], S["ftg"], np.float32)
+
+        def g_xy(i, v, gw, gh):
+            x = GPAD + (gw - 2 * GPAD) * (i / max(S["N"] - 1, 1))
+            y = 8 + (gh - 16) * (1.0 - v)
+            return x, y
+
+        def draw_graph():
+            graph.delete("all")
+            if S["frames"] is None:
+                return
+            gw = max(graph.winfo_width(), 60); gh = max(graph.winfo_height(), 40)
+            fa = S["gch"] == "f"
+            # 조리개 커브 (주황) — 비활성 채널은 흐리게
+            ac = ap_curve() / 100.0
+            pts = []
+            for i in range(S["N"]):
+                x, y = g_xy(i, float(ac[i]), gw, gh)
+                pts += [x, y]
+            if len(pts) >= 4 and (S["akeys"] or not fa):
+                graph.create_line(*pts, fill="#ff9f43" if not fa else "#5a3a20", width=2)
+            # 초점 커브 (라임)
+            c = cur_curve()
+            pts = []
+            for i in range(S["N"]):
+                x, y = g_xy(i, float(c[i]), gw, gh)
+                pts += [x, y]
+            if len(pts) >= 4:
+                graph.create_line(*pts, fill=COL["lime"] if fa else "#3f5220", width=2)
+            for j, kf in enumerate(S["keys"]):
+                x, y = g_xy(kf["f"], kf["v"], gw, gh)
+                col = "#ffd93d" if fa else "#6a5a20"
+                graph.create_polygon(x, y - 5, x + 5, y, x, y + 5, x - 5, y,
+                                     fill=col, outline="#0a0b0c")
+            for j, kf in enumerate(S["akeys"]):
+                x, y = g_xy(kf["f"], kf["v"] / 100.0, gw, gh)
+                col = "#ff9f43" if not fa else "#6a4423"
+                graph.create_rectangle(x - 4, y - 4, x + 4, y + 4,
+                                       fill=col, outline="#0a0b0c")
+            x, _ = g_xy(S["cur"], 0, gw, gh)
+            graph.create_line(x, 2, x, gh - 2, fill=COL["dim"])
+            lab = ("가까움", "멀리") if fa else ("얕은 심도", "깊은 심도")
+            graph.create_text(GPAD + 2, 9, text=lab[0], anchor="w", fill=COL["dim"], font=(MONO, 7))
+            graph.create_text(GPAD + 2, gh - 9, text=lab[1], anchor="w", fill=COL["dim"], font=(MONO, 7))
+
+        def rebuild_segments(j):
+            """키프레임 j 이웃 구간을 스무스스텝으로 재생성 (프리미어식 재보간)"""
+            ks = S["keys"]
+
+            def seg(af, av, bf, bv):
+                if bf <= af:
+                    return
+                t = np.linspace(0.0, 1.0, bf - af + 1)
+                S["fc"][af:bf + 1] = av + (bv - av) * (t * t * (3 - 2 * t))
+                S["recmask"][af:bf + 1] = True
+            kf = ks[j]
+            if j > 0:
+                seg(ks[j - 1]["f"], ks[j - 1]["v"], kf["f"], kf["v"])
+            else:
+                S["fc"][:kf["f"] + 1] = kf["v"]; S["recmask"][:kf["f"] + 1] = True
+            if j < len(ks) - 1:
+                seg(kf["f"], kf["v"], ks[j + 1]["f"], ks[j + 1]["v"])
+            else:
+                S["fc"][kf["f"]:] = kf["v"]; S["recmask"][kf["f"]:] = True
+
+        def add_key(f, v):
+            for kf in S["keys"]:
+                if abs(kf["f"] - f) <= 2:
+                    kf["v"] = float(v)
+                    draw_graph()
+                    return
+            S["keys"].append({"f": int(f), "v": float(v)})
+            S["keys"].sort(key=lambda k: k["f"])
+            draw_graph()
+
+        def g_frame_of(e):
+            gw = max(graph.winfo_width(), 60)
+            t = (e.x - GPAD) / max(gw - 2 * GPAD, 1)
+            return int(round(min(max(t, 0.0), 1.0) * (S["N"] - 1)))
+
+        def _klist():
+            return S["keys"] if S["gch"] == "f" else S["akeys"]
+
+        def _kv_of_y(e):
+            gh = max(graph.winfo_height(), 40)
+            v = float(min(max(1.0 - (e.y - 8) / max(gh - 16, 1), 0.0), 1.0))
+            return v if S["gch"] == "f" else v * 100.0
+
+        def _hit(e):
+            gw = max(graph.winfo_width(), 60); gh = max(graph.winfo_height(), 40)
+            for j, kf in enumerate(_klist()):
+                v = kf["v"] if S["gch"] == "f" else kf["v"] / 100.0
+                x, y = g_xy(kf["f"], v, gw, gh)
+                if abs(e.x - x) <= 6 and abs(e.y - y) <= 6:
+                    return j
+            return None
+
+        def g_press(e):
+            if S["frames"] is None:
+                return
+            gdrag["i"] = _hit(e)
+            if gdrag["i"] is None:
+                S["cur"] = g_frame_of(e); pos_var.set(S["cur"]); request_render()
+
+        def g_drag(e):
+            if S["frames"] is None:
+                return
+            j = gdrag["i"]
+            if j is None:
+                S["cur"] = g_frame_of(e); pos_var.set(S["cur"]); request_render()
+                return
+            ks = _klist(); kf = ks[j]
+            lo = ks[j - 1]["f"] + 1 if j > 0 else 0
+            hi = ks[j + 1]["f"] - 1 if j < len(ks) - 1 else S["N"] - 1
+            kf["f"] = int(min(max(g_frame_of(e), lo), hi))
+            kf["v"] = _kv_of_y(e)
+            if S["gch"] == "f":
+                rebuild_segments(j)
+            draw_graph()
+
+        def g_release(e):
+            if gdrag["i"] is not None:
+                gdrag["i"] = None
+                request_render()
+
+        def g_add(e):
+            """더블클릭 = 활성 채널에 키프레임 추가 (그 프레임의 현재 커브값으로)"""
+            if S["frames"] is None:
+                return
+            f = g_frame_of(e)
+            ks = _klist()
+            for kf in ks:
+                if abs(kf["f"] - f) <= 1:
+                    return
+            v = float(cur_curve()[f]) if S["gch"] == "f" else float(ap_curve()[f])
+            ks.append({"f": int(f), "v": v})
+            ks.sort(key=lambda k: k["f"])
+            draw_graph()
+
+        def g_del(e):
+            """우클릭 = 키프레임 삭제 (이웃 사이 스무스 재보간)"""
+            if S["frames"] is None:
+                return
+            j = _hit(e)
+            if j is None:
+                return
+            ks = _klist()
+            kf = ks.pop(j)
+            if S["gch"] == "f" and ks:
+                jn = min(j, len(ks) - 1)
+                rebuild_segments(jn)
+            draw_graph(); request_render()
+        # ---- 렌즈 팩 (보케 모양 · 색수차 · 브리딩) ----
+        lrow = tk.Frame(wrap, bg=COL["bg"])
+        SHAPES = [("disc", "보케: 원형"), ("hex", "보케: 6날"),
+                  ("oct", "보케: 8날"), ("ana", "보케: 아나모픽")]
+        shp_btn = canvas_button(lrow, "보케: 원형", 110, 26, primary=False)
+        shp_btn.pack(side="left", padx=(0, 12))
+
+        def cycle_shape():
+            idx = [s0 for s0, _ in SHAPES].index(S["lshape"])
+            S["lshape"], label = SHAPES[(idx + 1) % len(SHAPES)]
+            shp_btn.set_text(label)
+            request_render()
+        shp_btn.bind("<Button-1>", lambda e: cycle_shape())
+        tk.Label(lrow, text="색수차", bg=COL["bg"], fg=COL["sub"],
+                 font=(FONT, 9)).pack(side="left")
+        ca_var = tk.DoubleVar(value=30.0)
+
+        def on_ca(v):
+            S["lca"] = float(v) / 100.0
+            request_render()
+        tk.Scale(lrow, from_=0, to=100, orient="horizontal", variable=ca_var,
+                 command=on_ca, showvalue=True, length=130, bg=COL["card"],
+                 fg=COL["text"], troughcolor=COL["card2"], highlightthickness=0,
+                 bd=0, font=(MONO, 8)).pack(side="left", padx=(4, 14))
+        tk.Label(lrow, text="브리딩", bg=COL["bg"], fg=COL["sub"],
+                 font=(FONT, 9)).pack(side="left")
+        br_var = tk.DoubleVar(value=40.0)
+
+        def on_br(v):
+            S["lbr"] = float(v) / 100.0
+            request_render()
+        tk.Scale(lrow, from_=0, to=100, orient="horizontal", variable=br_var,
+                 command=on_br, showvalue=True, length=130, bg=COL["card"],
+                 fg=COL["text"], troughcolor=COL["card2"], highlightthickness=0,
+                 bd=0, font=(MONO, 8)).pack(side="left", padx=(4, 0))
+        lrow.pack(fill="x", pady=(4, 0))
+
+        graph.bind("<Button-1>", g_press)
+        graph.bind("<B1-Motion>", g_drag)
+        graph.bind("<ButtonRelease-1>", g_release)
+        graph.bind("<Double-Button-1>", g_add)
+        graph.bind("<Button-3>", g_del)
+        graph.bind("<Configure>", lambda e: draw_graph())
+
+        def play_loop():
+            if not S["playing"] or S["frames"] is None:
+                return
+            if S["recording"] and S["cur"] >= S["N"] - 1:
+                S["recording"] = False             # 테이크 완료: 끝 프레임에서 자동 종료
+                S["playing"] = False
+                rec_btn.set_text("● 녹화"); set_lamp(COL["card2"]); play_btn.set_text("▶")
+                status.configure(text="녹화 완료 — 아래 그래프에서 키프레임 수정 가능", fg=COL["ok"])
+                draw_graph(); request_render()
+                return
+            S["cur"] = (S["cur"] + 1) % S["N"]
+            if S["recording"]:
+                S["fc"][S["cur"]] = S["focus"]; S["recmask"][S["cur"]] = True
+            pos_var.set(S["cur"]); request_render()
+            root.after(int(1000 / min(S["fps"], 20)), play_loop)
+
+        def toggle_play():
+            if S["frames"] is None:
+                return
+            S["playing"] = not S["playing"]
+            play_btn.set_text("❚❚" if S["playing"] else "▶")
+            if S["playing"]:
+                play_loop()
+            else:
+                request_render()               # 정지 시 현재 프레임 풀 해상도로 재렌더
+        play_btn.bind("<Button-1>", lambda e: toggle_play())
+
+        # ---- 키보드: 1~4 = 휠 감도 기어(왼손 변속), Space = 재생/정지 ----
+        GEARS = {"1": 1.5, "2": 4.0, "3": 8.0, "4": 14.0}
+
+        def on_gear(e):
+            if current["idx"] != 5:
+                return                          # 다른 탭에선 기본 동작 유지
+            g = GEARS.get(e.char)
+            if g is None:
+                return
+            sens_var.set(g)
+            status.configure(text=f"휠 감도 {e.char}단 ({g:g})", fg=COL["sub"])
+            return "break"
+
+        def on_space(e):
+            if current["idx"] != 5:
+                return
+            toggle_play()
+            return "break"
+        for _k in ("1", "2", "3", "4"):
+            root.bind(f"<Key-{_k}>", on_gear)
+        root.bind("<space>", on_space)
+
+        # ---- 포커스 마커 (Q/W/E/R = 무선팔로우 테이프 마킹) ----
+        # 없으면 현재 초점에 찍고, 있으면 그 위치로 트윈 이동(녹화 중 랙 포커스).
+        # Shift+키 = 현재 초점으로 다시 찍기, Ctrl+키 = 마커 삭제.
+        MARKC = {"q": "#ff6b6b", "w": "#ffd93d", "e": "#6bcbff", "r": "#b76bff"}
+
+        def on_mark(e):
+            if current["idx"] != 5 or S["pv"] is None:
+                return
+            ch = e.keysym.lower()
+            if ch not in MARKC:
+                return
+            if e.state & 0x0004:               # Ctrl = 삭제
+                if ch in S["marks"]:
+                    del S["marks"][ch]
+                    status.configure(text=f"마커 {ch.upper()} 삭제", fg=COL["sub"])
+                    draw_wheel()
+            elif e.state & 0x0001 or ch not in S["marks"]:   # Shift 또는 첫 지정 = 찍기
+                S["marks"][ch] = S["ftg"]
+                status.configure(text=f"마커 {ch.upper()} = 초점 {S['ftg']*100:.0f}%", fg=COL["sub"])
+                draw_wheel()
+            else:                              # 재호출 = 마커로 부드럽게 랙 포커스
+                f1 = S["marks"][ch]
+                if S["recording"]:
+                    add_key(S["cur"], S["focus"])  # 랙 시작 키프레임
+                dur = min(3.0, 0.15 + abs(f1 - S["focus"]) * 6.0 / max(sens_var.get(), 0.5))
+                S["glide"] = (S["focus"], f1, time.perf_counter(), dur)   # 기어(감도) 비례 속도
+                S["ftg"] = f1
+                fval.configure(text=f"초점 {f1*100:4.0f}%  ({'가까움' if f1>0.6 else '멀리' if f1<0.4 else '중간'})")
+                draw_wheel()
+                if not S["tw"]:
+                    S["tw"] = True
+                    tween_tick()
+                status.configure(text=f"마커 {ch.upper()}로 이동", fg=COL["sub"])
+            return "break"
+        for _k in ("q", "w", "e", "r"):
+            root.bind(f"<Key-{_k}>", on_mark)
+            root.bind(f"<Key-{_k.upper()}>", on_mark)
+
+        # ---- A/D = 조리개 키 조절 (누르고 있으면 점진 가속) ----
+        apk = {"t": 0.0, "n": 0}
+
+        def on_apkey(e):
+            if current["idx"] != 5:
+                return
+            ch = e.keysym.lower()
+            if ch not in ("a", "d"):
+                return
+            now = time.perf_counter()
+            apk["n"] = apk["n"] + 1 if now - apk["t"] < 0.15 else 0   # 연타/홀드 감지
+            apk["t"] = now
+            step = min(8.0, 1.0 + apk["n"] * 0.5)   # 한 번 탭=정확히 1칸, 홀드 시 가속
+            v = float(round(min(100.0, max(0.0, ap_var.get() + (step if ch == "d" else -step)))))
+            ap_var.set(v)
+            on_ap(v)
+            return "break"
+        for _k in ("a", "d", "A", "D"):
+            root.bind(f"<Key-{_k}>", on_apkey)
+
+        # ---- 미리보기 렌더 (블러 스택 캐시 + 렌더 요청 병합) ----
+        def _pv_slices(i):
+            key = (i, round(S["hl"], 2))       # 프레임/하이라이트 바뀔 때만 재분해
+            if S["stk_key"] != key:
+                S["stk"] = dof_slices(S["pv"][i], S["pvd"][i], S["hl"])
+                S["stk_key"] = key
+            return S["stk"]
+
+        def render_preview():
+            if S["pv"] is None:
+                return
+            i = S["cur"]
+            img, dp = S["pv"][i], S["pvd"][i]
+            lo = S["playing"]                  # 재생 중엔 저해상(384) 프리뷰 — 매 프레임
+            if lo:                             # 새 분해가 필요해 640으론 20fps가 안 나옴
+                plw = 384
+                plh = max(2, int(round(plw * S["ph"] / S["pw"])))
+                img = cv2.resize(img, (plw, plh), interpolation=cv2.INTER_AREA)
+                if isinstance(dp, tuple):
+                    dp = (cv2.resize(dp[0], (plw, plh), interpolation=cv2.INTER_NEAREST),
+                          cv2.resize(dp[1], (plw, plh), interpolation=cv2.INTER_NEAREST),
+                          cv2.resize(dp[2], (plw, plh), interpolation=cv2.INTER_NEAREST),
+                          cv2.resize(dp[3], (plw, plh), interpolation=cv2.INTER_LINEAR))
+                else:
+                    dp = cv2.resize(dp, (plw, plh), interpolation=cv2.INTER_NEAREST)
+            ap_now = float(ap_curve()[i]) if S["akeys"] else S["ap"]
+            ap_px = (ap_now / 100.0 * 0.04) * img.shape[1]
+            if ap_px < 0.6:
+                out = img
+            elif lo:
+                out = dof_apply(img, dp, S["focus"], ap_px, fast=True,
+                                shape=S["lshape"], ca=S["lca"], breath=S["lbr"])
+            else:
+                out = dof_apply(img, dp, S["focus"], ap_px,
+                                slices=_pv_slices(i), fast=True,
+                                shape=S["lshape"], ca=S["lca"], breath=S["lbr"])
+            bgr = np.clip(out * 255.0, 0, 255).astype(np.uint8)
+            if lo:
+                bgr = cv2.resize(bgr, (S["pw"], S["ph"]), interpolation=cv2.INTER_LINEAR)
+            ok, buf = cv2.imencode(".ppm", bgr)
+            if not ok:
+                return
+            S["view"] = bgr                                  # 돋보기 소스
+            S["photo"] = tk.PhotoImage(data=buf.tobytes())   # PPM은 raw 바이트만 인식 (base64 불가)
+            prev_cv.delete("all")
+            prev_cv.create_image(PVW / 2, S["ph"] / 2, image=S["photo"])
+            frm_lbl.configure(text=f"{i+1}/{S['N']}")
+            if S["cnt"]:
+                prev_cv.create_text(PVW / 2, S["ph"] / 2, text=str(S["cnt"]),
+                                    fill="#ff5252", font=(FONT, 64, "bold"), tags="cntdown")
+            draw_graph()
+            update_mag()
+
+        def request_render():
+            if S["rq"]:                        # 연속 휠/드래그 이벤트 병합
+                return
+            S["rq"] = True
+
+            def _go():
+                S["rq"] = False
+                render_preview()
+            root.after(15, _go)
+
+        # ---- 돋보기 (Tab 토글, 마우스 위치 ×10) ----
+        MAGX = 10
+
+        def update_mag():
+            m = S["mag"]
+            if m is None or not m.winfo_exists() or S["view"] is None:
+                return
+            mcv = S["magcv"]
+            mw = max(mcv.winfo_width(), 40); mh = max(mcv.winfo_height(), 30)
+            view = S["view"]; vh, vw = view.shape[:2]
+            sw = max(4, round(mw / MAGX)); sh = max(3, round(mh / MAGX))
+            sw = min(sw, vw); sh = min(sh, vh)
+            cx = min(max(int(S["mx"]), 0), vw - 1)
+            cy = min(max(int(S["my"]), 0), vh - 1)
+            x0 = min(max(cx - sw // 2, 0), vw - sw)
+            y0 = min(max(cy - sh // 2, 0), vh - sh)
+            big = cv2.resize(view[y0:y0 + sh, x0:x0 + sw], (sw * MAGX, sh * MAGX),
+                             interpolation=cv2.INTER_NEAREST)
+            ok, buf = cv2.imencode(".ppm", big)
+            if not ok:
+                return
+            S["magphoto"] = tk.PhotoImage(data=buf.tobytes())
+            mcv.delete("all")
+            mcv.create_image(mw / 2, mh / 2, image=S["magphoto"])
+
+        def close_mag():
+            if S["mag"] is not None and S["mag"].winfo_exists():
+                S["mag"].destroy()
+            S["mag"] = None
+
+        def toggle_mag(_=None):
+            if current["idx"] != 5:            # 포커싱 탭에서만 — 다른 탭은 Tab 기본동작
+                return
+            if S["mag"] is not None and S["mag"].winfo_exists():
+                close_mag()
+                return "break"
+            if S["pv"] is None:
+                return "break"
+            m = tk.Toplevel(root)
+            m.title(f"돋보기 ×{MAGX} — Tab으로 닫기")
+            m.configure(bg="#0a0b0c")
+            m.attributes("-topmost", True)     # 이동·크기조절은 OS 창 그대로
+            m.geometry(f"320x220+{root.winfo_pointerx() + 24}+{root.winfo_pointery() + 24}")
+            m.minsize(120, 90)
+            mcv = tk.Canvas(m, bg="#0a0b0c", highlightthickness=0)
+            mcv.pack(fill="both", expand=True)
+            S["mag"], S["magcv"] = m, mcv
+            m.bind("<Configure>", lambda e: update_mag())
+            m.bind("<Tab>", toggle_mag)        # 돋보기 창에 포커스 있어도 Tab으로 닫힘
+            for _k in ("1", "2", "3", "4"):    # 돋보기 창 포커스 중에도 기어/재생 단축키
+                m.bind(f"<Key-{_k}>", on_gear)
+            for _k in ("q", "w", "e", "r"):
+                m.bind(f"<Key-{_k}>", on_mark)
+                m.bind(f"<Key-{_k.upper()}>", on_mark)
+            for _k in ("a", "d", "A", "D"):
+                m.bind(f"<Key-{_k}>", on_apkey)
+            m.bind("<space>", on_space)
+            m.protocol("WM_DELETE_WINDOW", close_mag)
+            update_mag()
+            return "break"
+        root.bind("<Tab>", toggle_mag)
+
+        def on_move(e):
+            S["mx"], S["my"] = e.x, e.y
+            if S["mag"] is not None:
+                update_mag()
+        prev_cv.bind("<Motion>", on_move)
+
+        # ---- 로딩 / 뎁스 인식 ----
+        def python_exe():
+            if getattr(sys, "frozen", False):
+                return shutil.which("python") or shutil.which("py") or "python"
+            return sys.executable
+
+        def depth_script():
+            d = (os.path.dirname(os.path.abspath(sys.argv[0])) if getattr(sys, "frozen", False)
+                 else os.path.dirname(os.path.abspath(__file__)))
+            return os.path.join(d, "depth_extract.py")
+
+        def load_video(path):
+            if S["busy"]:
+                return
+            S["busy"] = True; S["playing"] = False; S["recording"] = False
+            S["cnt"] = None
+            rec_btn.set_text("● 녹화"); play_btn.set_text("▶"); set_lamp(COL["card2"])
+            status.configure(text=f"불러오는 중: {os.path.basename(path)} …", fg=COL["sub"])
+
+            def work():
+                try:
+                    cap = cv2.VideoCapture(path)
+                    fps = cap.get(cv2.CAP_PROP_FPS) or 24.0
+                    frames = []
+                    while True:
+                        ok, f = cap.read()
+                        if not ok:
+                            break
+                        frames.append(f)
+                    cap.release()
+                    if not frames:
+                        raise RuntimeError("프레임 없음")
+                    H, W = frames[0].shape[:2]
+                    pw = PVW; ph = int(round(PVW * H / W))
+                    pv = [cv2.resize(f, (pw, ph)).astype(np.float32) / 255.0 for f in frames]
+                    root.after(0, lambda: status.configure(text="깊이 인식 중 … (torch/GPU)"))
+                    # subprocess 뎁스 추출
+                    tmp = os.path.join(os.path.dirname(os.path.abspath(path)),
+                                       "._focus_depth.npz")
+                    cmd = [python_exe(), depth_script(), path, tmp]
+                    pr = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                          text=True, creationflags=(0x08000000 if os.name == "nt" else 0))
+                    for line in pr.stdout:
+                        line = line.strip()
+                        if line.startswith("PROG"):
+                            root.after(0, lambda l=line: status.configure(text=f"깊이 인식 {l.split()[1]}"))
+                        elif line.startswith("STAB"):
+                            root.after(0, lambda: status.configure(text="깊이 시간축 안정화 …"))
+                        elif line.startswith("SNAP"):
+                            root.after(0, lambda: status.configure(text="깊이 경계 정밀화 …"))
+                        elif line.startswith("MATTE"):
+                            root.after(0, lambda l=line: status.configure(text=f"털 매팅(ViTMatte) {l.split()[1]}"))
+                        elif line.startswith("SAM"):
+                            root.after(0, lambda: status.configure(text="피사체 분리(SAM2) …"))
+                    pr.wait()
+                    if pr.returncode != 0 or not os.path.exists(tmp):
+                        raise RuntimeError("뎁스 추출 실패 (시스템 파이썬에 torch/transformers 필요)")
+                    z = np.load(tmp)
+                    depth16 = z["depth"]; N = int(z["n"])
+                    dn16 = z["dnear"] if "dnear" in z.files else None
+                    df16 = z["dfar"] if "dfar" in z.files else None
+                    mt8 = z["matte"] if "matte" in z.files else None
+                    pvd = []
+                    for k in range(N):
+                        dh = cv2.resize(depth16[k].astype(np.float32) / 65535.0, (pw, ph),
+                                        interpolation=cv2.INTER_NEAREST)   # 절벽 보존
+                        if mt8 is None:
+                            pvd.append(dh)
+                        else:                              # refine-edge 팩 (털 매트)
+                            pvd.append((dh,
+                                        cv2.resize(dn16[k].astype(np.float32) / 65535.0, (pw, ph),
+                                                   interpolation=cv2.INTER_NEAREST),
+                                        cv2.resize(df16[k].astype(np.float32) / 65535.0, (pw, ph),
+                                                   interpolation=cv2.INTER_NEAREST),
+                                        cv2.resize(mt8[k].astype(np.float32) / 255.0, (pw, ph),
+                                                   interpolation=cv2.INTER_LINEAR)))
+                    depth16 = (depth16, dn16, df16, mt8)
+                    try:
+                        os.remove(tmp)
+                    except Exception:
+                        pass
+                    S.update({"frames": frames, "pv": pv, "depth16": depth16, "pvd": pvd,
+                              "N": N, "W": W, "H": H, "fps": fps, "pw": pw, "ph": ph,
+                              "cur": 0, "src": path, "fc": np.full(N, 0.5, np.float32),
+                              "recmask": np.zeros(N, bool), "stk": None, "stk_key": None,
+                              "marks": {}, "keys": [], "akeys": []})
+
+                    def done():
+                        tl_scale.configure(to=N - 1); pos_var.set(0)
+                        prev_cv.configure(height=ph)
+                        status.configure(text=f"준비완료 · {N}프레임 {W}x{H} · 휠로 포커스 조절", fg=COL["ok"])
+                        set_focus(0.5)
+                    root.after(0, done)
+                except Exception as e:
+                    root.after(0, lambda: status.configure(text=f"실패: {e}", fg=COL["err"]))
+                finally:
+                    S["busy"] = False
+            threading.Thread(target=work, daemon=True).start()
+
+        def do_render():
+            if S["frames"] is None or S["busy"]:
+                return
+            S["busy"] = True; S["playing"] = False
+            status.configure(text="렌더 중 …", fg=COL["sub"])
+            fc = S["fc"].copy()
+            if S["recmask"].any():
+                idx = np.where(S["recmask"])[0]
+                fc = np.interp(np.arange(S["N"]), idx, fc[idx]).astype(np.float32)
+                if S["N"] >= 5:
+                    # 녹화 커브 정리 — 일시정지 중 휠 탐색 등으로 한 프레임에만 박힌
+                    # 초점 스파이크가 렌더에서 단발 깜빡임이 됨: 미디언 디스파이크 +
+                    # 가우시안 스무딩(실제 포커스 풀러의 손맛)
+                    fc[1:-1] = np.median(np.stack([fc[:-2], fc[1:-1], fc[2:]]), axis=0)
+                    k = np.exp(-0.5 * (np.arange(-3, 4) / 1.5) ** 2)
+                    fc = np.convolve(np.pad(fc, 3, mode="edge"), k / k.sum(),
+                                     mode="valid").astype(np.float32)
+            else:
+                fc = np.full(S["N"], S["ftg"], np.float32)
+            if S["akeys"]:
+                ap_frac = (ap_curve() / 100.0 * 0.04).astype(np.float32)
+            else:
+                ap_frac = S["ap"] / 100.0 * 0.04
+            hl = S["hl"]
+            lshape, lca, lbr = S["lshape"], S["lca"], S["lbr"]
+
+            def work():
+                try:
+                    def prog(v):
+                        root.after(0, lambda: status.configure(text=f"렌더 중 … {v}%"))
+                    dst = focus_render_video(S["frames"], S["depth16"], fc, ap_frac,
+                                             S["fps"], S["src"], progress=prog, hl=hl,
+                                             shape=lshape, ca=lca, breath=lbr)
+                    root.after(0, lambda: status.configure(
+                        text=f"완료: {os.path.basename(dst)} (+.mp4)", fg=COL["ok"]))
+                except Exception as e:
+                    root.after(0, lambda: status.configure(text=f"렌더 실패: {e}", fg=COL["err"]))
+                finally:
+                    S["busy"] = False
+            threading.Thread(target=work, daemon=True).start()
+        render_btn.bind("<Button-1>", lambda e: do_render())
+
+        def open_dialog():
+            p = filedialog.askopenfilename(filetypes=[("영상", "*.mp4 *.mov *.avi *.mkv *.webm")])
+            if p:
+                load_video(p)
+        open_btn = canvas_button(top, "영상 열기", 90, 30, primary=True)
+        open_btn.pack(side="right"); open_btn.bind("<Button-1>", lambda e: open_dialog())
+
+        if dnd_ok:
+            def on_drop(ev):
+                try:
+                    paths = root.tk.splitlist(ev.data)
+                except Exception:
+                    paths = [ev.data]
+                if paths:
+                    load_video(paths[0].strip("{}"))
+            for w in (page, prev_cv):
+                try:
+                    w.drop_target_register(DND_FILES); w.dnd_bind("<<Drop>>", on_drop)
+                except Exception:
+                    pass
+
+        draw_wheel()
+        page.add_files = lambda files: (files and load_video(files[0]))
+        return page
+
     pages[0] = build_page(
-        "그라데이션 밴딩(계단현상)을 부드럽게 풀어줘요 — 디테일은 그대로. 원본 폴더에 ",
-        "_debanded.png / .mp4", deband, "_debanded", media=True)
+        "밴딩(계단현상) 제거 — 이미지는 디테일 보존 스무딩, 영상은 여러 프레임을 "
+        "스태킹해 진짜 10비트 계조를 복원(색보정 버팀). 영상은 ProRes .mov(그레이딩용)+"
+        ".mp4(미리보기), 이미지는 .png 로 원본 폴더에 저장 ",
+        "_debanded", deband, "_debanded", media=True)
     pages[1] = build_photoreal_page()
     pages[2] = build_removegpt_page()
     pages[3] = build_sizzle_page()
     pages[4] = build_detailboost_page()
+    pages[5] = build_focus_page()
 
     current["idx"] = 0
     draw_tabs()
@@ -2674,6 +4038,9 @@ def run_gui(initial_files):
                 root.after(900, pages[2].run_convert)
         else:
             root.after(200, pages[0].add_files, initial_files)
+
+    if "--buildtest" in sys.argv:   # 모든 탭 생성 검증 후 자동 종료
+        root.after(600, root.destroy)
 
     root.mainloop()
 
@@ -2712,7 +4079,7 @@ def main():
                 elif "--sizzlefix" in sys.argv and p.lower().endswith(VEXTS):
                     dst = fix_sizzle_video(p)
                 elif p.lower().endswith(VEXTS):
-                    dst = deband_video(p)
+                    dst = stack_deband_video(p)
                 else:
                     dst = process_file(p, fn, suffix)
                 print("OK", dst)
