@@ -24,7 +24,7 @@ import cv2
 EXTS = (".png", ".jpg", ".jpeg", ".webp", ".bmp", ".tif", ".tiff")
 VEXTS = (".mp4", ".mov", ".avi", ".mkv", ".webm")
 APP_TITLE = "no photoshop — 이미지 후처리"
-APP_VER = "ver 1.2.2"
+APP_VER = "ver 1.3"
 
 COL = {
     "bg":     "#0e0f10",
@@ -3516,7 +3516,7 @@ def run_gui(initial_files):
         def g_release(e):
             if gdrag["i"] is not None:
                 gdrag["i"] = None
-                request_render()
+                request_render(); save_proj()
 
         def g_add(e):
             """더블클릭 = 활성 채널에 키프레임 추가 (그 프레임의 현재 커브값으로)"""
@@ -3589,6 +3589,59 @@ def run_gui(initial_files):
         graph.bind("<Button-3>", g_del)
         graph.bind("<Configure>", lambda e: draw_graph())
 
+        # ---- 포커스 프로젝트 저장/불러오기 (영상 옆 *_focus.json) ----
+        def proj_path():
+            return os.path.splitext(S["src"])[0] + "_focus.json" if S["src"] else None
+
+        def save_proj():
+            p = proj_path()
+            if not p or S["fc"] is None:
+                return
+            try:
+                import json
+                data = {"ver": 1, "ftg": float(S["ftg"]), "ap": float(S["ap"]),
+                        "hl": float(S["hl"]), "lshape": S["lshape"],
+                        "lca": float(S["lca"]), "lbr": float(S["lbr"]),
+                        "marks": {k: float(v) for k, v in S["marks"].items()},
+                        "keys": S["keys"], "akeys": S["akeys"],
+                        "fc": [round(float(v), 4) for v in S["fc"]],
+                        "rec": [int(i) for i in np.where(S["recmask"])[0]]}
+                with open(p, "w", encoding="utf-8") as f:
+                    json.dump(data, f, ensure_ascii=False)
+            except Exception:
+                pass
+
+        def load_proj():
+            p = proj_path()
+            if not p or not os.path.exists(p):
+                return False
+            try:
+                import json
+                with open(p, encoding="utf-8") as f:
+                    d = json.load(f)
+                if len(d.get("fc", [])) != S["N"]:
+                    return False
+                S["ftg"] = S["focus"] = float(d["ftg"])
+                S["ap"] = float(d["ap"]); ap_var.set(S["ap"])
+                S["hl"] = float(d["hl"]); hl_var.set(S["hl"] * 100.0)
+                S["lca"] = float(d.get("lca", 0.3)); ca_var.set(S["lca"] * 100.0)
+                S["lbr"] = float(d.get("lbr", 0.4)); br_var.set(S["lbr"] * 100.0)
+                S["lshape"] = d.get("lshape", "disc")
+                for s0, lab in SHAPES:
+                    if s0 == S["lshape"]:
+                        shp_btn.set_text(lab)
+                S["marks"] = {k: float(v) for k, v in d.get("marks", {}).items()}
+                S["keys"] = [{"f": int(k["f"]), "v": float(k["v"])} for k in d.get("keys", [])]
+                S["akeys"] = [{"f": int(k["f"]), "v": float(k["v"])} for k in d.get("akeys", [])]
+                S["fc"] = np.array(d["fc"], np.float32)
+                S["recmask"] = np.zeros(S["N"], bool)
+                for i in d.get("rec", []):
+                    if 0 <= i < S["N"]:
+                        S["recmask"][i] = True
+                return True
+            except Exception:
+                return False
+
         def play_loop():
             if not S["playing"] or S["frames"] is None:
                 return
@@ -3597,7 +3650,7 @@ def run_gui(initial_files):
                 S["playing"] = False
                 rec_btn.set_text("● 녹화"); set_lamp(COL["card2"]); play_btn.set_text("▶")
                 status.configure(text="녹화 완료 — 아래 그래프에서 키프레임 수정 가능", fg=COL["ok"])
-                draw_graph(); request_render()
+                draw_graph(); request_render(); save_proj()
                 return
             S["cur"] = (S["cur"] + 1) % S["N"]
             if S["recording"]:
@@ -3657,7 +3710,7 @@ def run_gui(initial_files):
             elif e.state & 0x0001 or ch not in S["marks"]:   # Shift 또는 첫 지정 = 찍기
                 S["marks"][ch] = S["ftg"]
                 status.configure(text=f"마커 {ch.upper()} = 초점 {S['ftg']*100:.0f}%", fg=COL["sub"])
-                draw_wheel()
+                draw_wheel(); save_proj()
             else:                              # 재호출 = 마커로 부드럽게 랙 포커스
                 f1 = S["marks"][ch]
                 if S["recording"]:
@@ -3917,8 +3970,13 @@ def run_gui(initial_files):
                     def done():
                         tl_scale.configure(to=N - 1); pos_var.set(0)
                         prev_cv.configure(height=ph)
-                        status.configure(text=f"준비완료 · {N}프레임 {W}x{H} · 휠로 포커스 조절", fg=COL["ok"])
-                        set_focus(0.5)
+                        if load_proj():
+                            status.configure(text=f"준비완료 · {N}프레임 · 저장된 포커스 프로젝트 복원됨", fg=COL["ok"])
+                            draw_wheel(); draw_graph()
+                            set_focus(S["ftg"])
+                        else:
+                            status.configure(text=f"준비완료 · {N}프레임 {W}x{H} · 휠로 포커스 조절", fg=COL["ok"])
+                            set_focus(0.5)
                     root.after(0, done)
                 except Exception as e:
                     root.after(0, lambda: status.configure(text=f"실패: {e}", fg=COL["err"]))
@@ -3959,6 +4017,7 @@ def run_gui(initial_files):
                     dst = focus_render_video(S["frames"], S["depth16"], fc, ap_frac,
                                              S["fps"], S["src"], progress=prog, hl=hl,
                                              shape=lshape, ca=lca, breath=lbr)
+                    root.after(0, save_proj)
                     root.after(0, lambda: status.configure(
                         text=f"완료: {os.path.basename(dst)} (+.mp4)", fg=COL["ok"]))
                 except Exception as e:
