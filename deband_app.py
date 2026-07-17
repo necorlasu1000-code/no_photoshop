@@ -24,7 +24,71 @@ import cv2
 EXTS = (".png", ".jpg", ".jpeg", ".webp", ".bmp", ".tif", ".tiff")
 VEXTS = (".mp4", ".mov", ".avi", ".mkv", ".webm")
 APP_TITLE = "no photoshop — 이미지 후처리"
-APP_VER = "ver 1.3"
+APP_VER = "ver 1.4"
+
+UPDATE_REPO = "necorlasu1000-code/no_photoshop"
+
+
+def _ver_tuple(v):
+    import re
+    n = [int(x) for x in re.findall(r"\d+", str(v))[:3]]
+    return tuple(n + [0] * (3 - len(n)))
+
+
+def check_update_async(root):
+    """사일런트 자동 업데이트 (EXE 실행일 때만): 시작 시 백그라운드로 최신
+    GitHub 릴리스를 확인하고 zip을 받아두면, 교체 스크립트가 앱 종료를 기다렸다가
+    조용히 파일을 교체한다 — 다음 실행부터 새 버전."""
+    if not getattr(sys, "frozen", False):
+        return
+
+    def work():
+        try:
+            import json, urllib.request, tempfile, zipfile, re
+            req = urllib.request.Request(
+                f"https://api.github.com/repos/{UPDATE_REPO}/releases/latest",
+                headers={"User-Agent": "no-photoshop-updater"})
+            with urllib.request.urlopen(req, timeout=10) as r:
+                rel = json.load(r)
+            tag = rel.get("tag_name", "")
+            if _ver_tuple(tag) <= _ver_tuple(APP_VER):
+                return
+            asset = next((a for a in rel.get("assets", [])
+                          if a.get("name", "").lower().endswith(".zip")), None)
+            if not asset:
+                return
+            appdir = os.path.dirname(os.path.abspath(sys.argv[0]))
+            tmp = tempfile.gettempdir()
+            zpath = os.path.join(tmp, "nophotoshop_update.zip")
+            urllib.request.urlretrieve(asset["browser_download_url"], zpath)
+            updir = os.path.join(tmp, "nophotoshop_update")
+            shutil.rmtree(updir, ignore_errors=True)
+            with zipfile.ZipFile(zpath) as z:
+                z.extractall(updir)
+            os.remove(zpath)
+            if not os.path.exists(os.path.join(updir, "No photoshop.exe")):
+                return                       # zip 구조 검증 실패 → 적용 안함
+            bat = os.path.join(tmp, "nophotoshop_apply.bat")
+            with open(bat, "w", encoding="utf-8") as f:
+                f.write('@echo off\r\nchcp 65001 >nul\r\n'
+                        ':wait\r\n'
+                        'tasklist /FI "IMAGENAME eq No photoshop.exe" | find /I "No photoshop.exe" >nul\r\n'
+                        'if not errorlevel 1 (timeout /t 2 /nobreak >nul & goto wait)\r\n'
+                        f'xcopy /E /Y /Q "{updir}\\*" "{appdir}\\" >nul\r\n'
+                        f'rmdir /S /Q "{updir}"\r\n'
+                        'del "%~f0"\r\n')
+            subprocess.Popen(["cmd", "/c", bat],
+                             creationflags=0x08000008,   # DETACHED | NO_WINDOW
+                             close_fds=True)
+            try:
+                root.after(0, lambda: root.title(
+                    f"{APP_TITLE}   ({tag} 준비됨 — 껐다 켜면 적용)"))
+            except Exception:
+                pass
+        except Exception:
+            pass
+    threading.Thread(target=work, daemon=True).start()
+
 
 COL = {
     "bg":     "#0e0f10",
@@ -1358,23 +1422,44 @@ def run_gui(initial_files):
     pages = {}
     current = {"idx": 0}
     TABS = ["밴딩 제거", "실사 질감", "Remove GPT", "우글거림 수정", "디테일 보강", "포커싱"]
+    MAIN_TABS = [0, 5]                      # 메인 노출: 밴딩 제거 · 포커싱
+    LEGACY_TABS = [1, 2, 3, 4]              # 레거시 메뉴로 이동
     TAB_W, TAB_H, PILL_PAD = 106, 40, 4
+
+    LEG_W = 96                               # '레거시 ⋯' 필 폭
+
+    def _pills():
+        """(x0, 폭, 종류, 값) — 메인 탭들 + 레거시 버튼"""
+        out = []
+        x = PILL_PAD
+        for i in MAIN_TABS:
+            out.append((x, TAB_W, "tab", i))
+            x += TAB_W
+        out.append((x, LEG_W, "legacy", None))
+        return out, x + LEG_W + PILL_PAD
 
     def draw_tabs(_=None):
         tabbar.delete("all")
-        total_w = TAB_W * len(TABS) + PILL_PAD * 2
+        pills, total_w = _pills()
         rrect(tabbar, 0, 6, total_w, 6 + TAB_H + PILL_PAD * 2, 14,
               fill=COL["card"], outline=COL["border"])
-        for i, name in enumerate(TABS):
-            x0 = PILL_PAD + i * TAB_W
-            y0 = 6 + PILL_PAD
-            if i == current["idx"]:
-                rrect(tabbar, x0, y0, x0 + TAB_W, y0 + TAB_H, 11,
+        y0 = 6 + PILL_PAD
+        for x0, w, kind, i in pills:
+            if kind == "tab":
+                name = TABS[i]
+                active = (i == current["idx"])
+            else:
+                name = "레거시 ⋯"
+                active = (current["idx"] in LEGACY_TABS)
+                if active:
+                    name = TABS[current["idx"]]
+            if active:
+                rrect(tabbar, x0, y0, x0 + w, y0 + TAB_H, 11,
                       fill=COL["lime"], outline="")
                 fg = "#101204"
             else:
-                fg = COL["sub"]
-            tabbar.create_text(x0 + TAB_W / 2, y0 + TAB_H / 2, text=name,
+                fg = COL["sub"] if kind == "tab" else COL["dim"]
+            tabbar.create_text(x0 + w / 2, y0 + TAB_H / 2, text=name,
                                fill=fg, font=(FONT, 11, "bold"))
         # 우측 끝 버전 표시
         bw = tabbar.winfo_width() or 900
@@ -1382,14 +1467,28 @@ def run_gui(initial_files):
                            fill=COL["dim"], font=(MONO, 9), anchor="e")
     tabbar.bind("<Configure>", draw_tabs)
 
+    def select_tab(idx):
+        if idx != current["idx"]:
+            current["idx"] = idx
+            draw_tabs()
+            pages[idx].tkraise()
+
     def on_tab_click(e):
-        total_w = TAB_W * len(TABS) + PILL_PAD * 2
-        if 0 <= e.x <= total_w:
-            idx = min(len(TABS) - 1, max(0, int((e.x - PILL_PAD) // TAB_W)))
-            if idx != current["idx"]:
-                current["idx"] = idx
-                draw_tabs()
-                pages[idx].tkraise()
+        pills, total_w = _pills()
+        for x0, w, kind, i in pills:
+            if x0 <= e.x <= x0 + w:
+                if kind == "tab":
+                    select_tab(i)
+                else:                        # 레거시 드롭다운
+                    menu = tk.Menu(root, tearoff=0, bg=COL["card"], fg=COL["text"],
+                                   activebackground=COL["lime"], activeforeground="#101204",
+                                   font=(FONT, 10))
+                    for li in LEGACY_TABS:
+                        menu.add_command(label=TABS[li],
+                                         command=lambda k=li: select_tab(k))
+                    menu.tk_popup(tabbar.winfo_rootx() + x0,
+                                  tabbar.winfo_rooty() + 6 + TAB_H + PILL_PAD * 2)
+                return
 
     tabbar.bind("<Button-1>", on_tab_click)
 
@@ -4097,6 +4196,8 @@ def run_gui(initial_files):
                 root.after(900, pages[2].run_convert)
         else:
             root.after(200, pages[0].add_files, initial_files)
+
+    check_update_async(root)        # 사일런트 자동 업데이트 (EXE만)
 
     if "--buildtest" in sys.argv:   # 모든 탭 생성 검증 후 자동 종료
         root.after(600, root.destroy)

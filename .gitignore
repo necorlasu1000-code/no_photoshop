@@ -10,3 +10,4 @@
 !vda/
 !vda/**
 vda/**/__pycache__/
+!make_release.py
