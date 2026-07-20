@@ -24,7 +24,7 @@ import cv2
 EXTS = (".png", ".jpg", ".jpeg", ".webp", ".bmp", ".tif", ".tiff")
 VEXTS = (".mp4", ".mov", ".avi", ".mkv", ".webm")
 APP_TITLE = "no photoshop — 이미지 후처리"
-APP_VER = "ver 1.4"
+APP_VER = "ver 1.4.1"
 
 UPDATE_REPO = "necorlasu1000-code/no_photoshop"
 
@@ -1377,7 +1377,7 @@ def process_file(src, fn, suffix, progress=None):
 # ---------------- GUI ----------------
 def run_gui(initial_files):
     import tkinter as tk
-    from tkinter import filedialog
+    from tkinter import filedialog, messagebox
 
     dnd_ok = False
     try:
@@ -3990,6 +3990,42 @@ def run_gui(initial_files):
                  else os.path.dirname(os.path.abspath(__file__)))
             return os.path.join(d, "depth_extract.py")
 
+        def _ai_ready():
+            """포커싱용 AI 스택(파이썬+torch) 사용 가능 여부 (결과 캐시)"""
+            if S.get("ai_ok"):
+                return True
+            py = python_exe()
+            if not py or not shutil.which(py) and not os.path.exists(py):
+                return False
+            try:
+                r = subprocess.run([py, "-c", "import torch"], timeout=45,
+                                   capture_output=True,
+                                   creationflags=(0x08000000 if os.name == "nt" else 0))
+                if r.returncode == 0:
+                    S["ai_ok"] = True
+                    return True
+            except Exception:
+                pass
+            return False
+
+        def _offer_install():
+            """AI 스택이 없으면 동봉된 설치 스크립트를 자동 실행 (원클릭 설치)"""
+            appdir = (os.path.dirname(os.path.abspath(sys.argv[0]))
+                      if getattr(sys, "frozen", False)
+                      else os.path.dirname(os.path.abspath(__file__)))
+            bat = os.path.join(appdir, "install_ai.bat")
+            if not os.path.exists(bat):
+                status.configure(text="AI 구성요소 없음 — install_ai.bat이 폴더에 없습니다", fg=COL["err"])
+                return
+            if not messagebox.askyesno(
+                    "포커싱 탭 첫 설정",
+                    "포커싱 탭에 필요한 AI 구성요소(파이썬 + PyTorch, 약 6GB)가 없습니다.\n\n"
+                    "지금 자동으로 설치할까요?  (인터넷 필요 · 15~30분 · 최초 1회)\n"
+                    "설치 창이 뜨며, 완료되면 영상을 다시 넣으면 됩니다."):
+                return
+            subprocess.Popen(["cmd", "/c", "start", "", bat], shell=False)
+            status.configure(text="AI 구성요소 설치 진행 중 — 설치 창 완료 후 영상을 다시 넣으세요", fg=COL["sub"])
+
         def load_video(path):
             if S["busy"]:
                 return
@@ -4000,6 +4036,9 @@ def run_gui(initial_files):
 
             def work():
                 try:
+                    if not _ai_ready():                 # AI 스택 없으면 원클릭 설치 제안
+                        root.after(0, _offer_install)
+                        return
                     cap = cv2.VideoCapture(path)
                     fps = cap.get(cv2.CAP_PROP_FPS) or 24.0
                     frames = []
