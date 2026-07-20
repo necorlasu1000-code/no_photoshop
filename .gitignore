@@ -11,3 +11,4 @@
 !vda/**
 vda/**/__pycache__/
 !make_release.py
+!install_ai.bat

@@ -26,6 +26,7 @@ if os.path.exists(zpath):
 with zipfile.ZipFile(zpath, "w", zipfile.ZIP_DEFLATED) as z:
     z.write(os.path.join("dist", "No photoshop.exe"), "No photoshop.exe")
     z.write("depth_extract.py", "depth_extract.py")
+    z.write("install_ai.bat", "install_ai.bat")
     for root, dirs, files in os.walk("vda"):
         dirs[:] = [d for d in dirs if d != "__pycache__"]
         for f in files:
