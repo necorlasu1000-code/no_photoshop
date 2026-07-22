@@ -1,49 +1,107 @@
 # No photoshop
 
-AI 생성 이미지·영상의 "AI 티"를 지우는 무설치 후처리 도구. **AI/API 없이** 고전 영상처리만으로 동작하고, 인터넷 연결 없이 오프라인에서 실행됩니다.
+AI 생성 영상·이미지의 "AI 티"를 지우는 후처리 도구입니다.
+**밴딩 제거**(10-bit 계조 복원)와 **포커싱**(뎁스 기반 시네마틱 아웃포커스 시뮬레이터)이 메인 기능입니다.
 
-`No photoshop.exe` 파일 하나만 전달하면 별도 설치 없이 바로 쓸 수 있습니다 (Windows).
+---
 
-## 다운로드
+## 📦 설치 방법 (처음 받는 분은 순서대로 따라하세요)
 
-**[⬇ No-photoshop-v0.2.exe](https://github.com/necorlasu1000-code/no_photoshop/releases/download/v0.2/No-photoshop-v0.2.exe)** — 설치 불필요, 다운로드 후 바로 실행 ([전체 릴리스 목록](https://github.com/necorlasu1000-code/no_photoshop/releases))
+### 1. 다운로드
 
-> 처음 실행 시 Windows SmartScreen 경고가 뜨면 **[추가 정보] → [실행]**을 누르세요 (서명 없는 EXE의 정상 동작입니다).
+**[⬇ NoPhotoshop_win.zip 다운로드](https://github.com/necorlasu1000-code/no_photoshop/releases/latest)** ← 이 링크에서 `NoPhotoshop_win.zip`을 받습니다.
 
-## 기능 (ver 0.2)
+> **💡 다운로드할 때 브라우저가 "안전하지 않은 파일" 경고를 띄우면?**
+> 크롬 기준: 다운로드 표시줄에서 `⋮` → **[유지]** 를 누르세요.
+> 이 경고는 바이러스가 아니라, **서명 인증서가 없는 신생 프로그램에 윈도우가 기본으로 띄우는 경고**입니다.
+> (소스 코드 전체가 이 저장소에 공개되어 있습니다)
 
-| 탭 | 설명 | 출력 |
-|---|---|---|
-| **밴딩 제거** | 그라데이션 밴딩·계단현상 제거 (IMG/VIDEO). 멀티스케일 엣지 보존 디밴딩 + 재밴딩 방지 디더 | `_debanded.png` / `.mp4` |
-| **실사 질감** | 실시간 미리보기 + 효과별 슬라이더로 실사 카메라 룩 (블랙 리프트, 하이라이트 롤오프, 블룸, 색수차, 비네트, 그레인). ARRI·8mm 등 프리셋 | `_photoreal.png` |
-| **Remove GPT** | GPT 이미지 특유의 도트 노이즈 제거 (표준/강력), 전후 비교 슬라이더 | `_nogpt.png` |
-| **우글거림 수정** | AI 영상의 파티클 끓는 텍스처를 모션보상 시간 안정화 + 모션블러 + 장면 적응 파티클 합성으로 수정 | `_particlefix.mp4` |
-| **디테일 보강** | AI 풀샷의 뭉개진 디테일 복원(하늘·구름 자동 보호) + 텍스처 우글거림 고정 + 카메라 저더 보정 + 180° 셔터 모션블러 | `_detail.mp4` |
+### 2. 압축 풀기
 
-영상 출력은 10-bit HEVC(yuv420p10le)로 인코딩되고 원본 오디오를 그대로 복사합니다.
+zip을 원하는 위치(예: `D:\NoPhotoshop\`)에 **폴더째** 풉니다.
+폴더 안의 파일들(`depth_extract.py`, `vda` 폴더 등)은 지우지 마세요 — 포커싱 탭이 사용합니다.
 
-## 소스로 실행
+### 3. 실행
 
-```
+**`No photoshop.exe`** 를 더블클릭합니다.
+
+> **💡 파란 화면으로 "Windows의 PC 보호" 가 뜨면?**
+> 1. **[추가 정보]** 클릭
+> 2. **[실행]** 버튼 클릭
+> 이것도 위와 같은 이유의 정상 경고이고, 최초 1회만 뜹니다.
+
+여기까지 하면 **밴딩 제거는 바로 사용 가능**합니다.
+
+### 4. 포커싱 탭 첫 설정 (최초 1회, 자동)
+
+1. 포커싱 탭에 영상을 드래그합니다
+2. AI 구성요소(파이썬 + PyTorch)가 없는 PC라면 **"지금 자동으로 설치할까요?"** 팝업이 뜹니다 → **[예]**
+3. 검은 설치 창이 뜨고 자동으로 설치됩니다 — **15~30분, 약 6GB** (기다리기만 하면 됨)
+4. 설치 창이 닫히면 영상을 **다시 드래그** → 첫 로드 때 AI 모델(~2GB)이 자동 다운로드됩니다 (이것도 1회만)
+5. 이후로는 인터넷 없이도 동작합니다
+
+### 5. 업데이트는 신경 쓸 필요 없음
+
+새 버전이 나오면 **앱을 껐다 켜는 것만으로 자동 적용**됩니다.
+(새 버전 다운로드가 준비되면 창 제목에 "vX.X 준비됨 — 껐다 켜면 적용"이 표시됩니다)
+
+### 시스템 요구사항
+
+| 항목 | 요구 |
+|---|---|
+| OS | Windows 10/11 (64bit) |
+| GPU | **NVIDIA 그래픽카드 (VRAM 6GB 이상 권장)** — 포커싱 탭 필수에 가까움. 없으면 매우 느림 |
+| 인터넷 | 최초 설치·모델 다운로드·자동 업데이트 시에만 필요 |
+| 디스크 | AI 구성요소 포함 약 10GB |
+
+---
+
+## 기능
+
+### 밴딩 제거 (메인)
+하늘·그라데이션의 계단현상(밴딩)을 여러 프레임 스태킹으로 **실제 10-bit 계조로 복원**합니다.
+출력: `_debanded.mov`(ProRes 422 HQ, 그레이딩용) + `_debanded.mp4`(미리보기), 이미지는 `_debanded.png`
+
+### 포커싱 (메인)
+AI 뎁스 인식 기반 **시네마틱 피사계 심도(DoF) 시뮬레이터** — 팬포커스 영상에 렌즈 아웃포커스를 입힙니다.
+
+- 포커스 휠(마우스 휠)로 초점 조절, 조리개로 심도 조절
+- **단축키**: `1~4` 휠 감도 기어 · `Q/W/E/R` 포커스 마커(찍기/이동) · `A/D` 조리개 · `Space` 재생/정지 · `Tab` ×10 돋보기
+- **녹화**: [녹화] → 3-2-1 카운트 → 자동 재생되며 포커스 조작이 기록 → 그래프에서 키프레임 수정 → [렌더]
+- 렌즈 수차 팩: 보케 모양(원형/6날/8날/아나모픽), 색수차, 포커스 브리딩
+- SAM2 + ViTMatte 피사체 매팅으로 털·머리카락 경계까지 처리
+- 작업 상태(마커·키프레임·커브)는 영상 옆 `*_focus.json`에 자동 저장·복원
+- 출력: `_focus.mov`(ProRes 422 HQ) + `_focus.mp4`(HEVC 10-bit)
+
+### 레거시 (탭바의 [레거시 ⋯] 메뉴)
+실사 질감 · Remove GPT · 우글거림 수정 · 디테일 보강 — 이전 버전의 도구들입니다.
+
+---
+
+## 자주 묻는 문제
+
+**Q. 백신이 바이러스라고 해요.**
+서명 없는 EXE에 대한 오탐입니다. 소스가 이 저장소에 전부 공개되어 있고, 직접 빌드할 수도 있습니다(아래).
+백신 예외 목록에 폴더를 추가하거나, 관리자가 나눠주는 zip(NAS 등)으로 받으면 경고가 줄어듭니다.
+
+**Q. 포커싱 탭에서 "뎁스 추출 실패"가 떠요.**
+AI 구성요소가 아직 없는 상태입니다. 영상을 다시 넣으면 설치 팝업이 뜹니다. 팝업이 안 뜨면 폴더의 `install_ai.bat`을 직접 실행하세요.
+
+**Q. 영상 인식이 너무 오래 걸려요.**
+NVIDIA GPU가 없거나 다른 프로그램이 VRAM을 다 쓰고 있는 경우입니다. 무거운 앱(프리미어 등)을 잠시 닫아보세요.
+
+---
+
+## 소스로 실행 / 빌드 (개발자용)
+
+```bash
 pip install opencv-python numpy tkinterdnd2 imageio-ffmpeg
+# 포커싱 탭까지: + torch torchvision(CUDA), transformers, huggingface_hub, einops, easydict, pillow
 python deband_app.py
 ```
 
-CLI 모드 (GUI 없이):
+EXE 빌드 및 릴리스 패키지:
 
+```bash
+python make_release.py   # dist/No photoshop.exe 빌드 + release/NoPhotoshop_win.zip 생성
 ```
-python deband_app.py --silent 이미지.png                # 디밴딩
-python deband_app.py --silent --photoreal 이미지.png    # 실사 질감
-python deband_app.py --silent --removegpt 이미지.png    # 도트 제거
-python deband_app.py --silent --sizzlefix 영상.mp4      # 우글거림 수정
-python deband_app.py --silent --detailboost 영상.mp4    # 디테일 보강
-```
-
-## EXE 빌드
-
-```
-pip install pyinstaller
-python -m PyInstaller "No photoshop.spec" --noconfirm
-```
-
-빌드 결과는 `dist/No photoshop.exe` (FFmpeg 포함, 단일 파일).
