@@ -79,9 +79,9 @@ def refine_matte(d, img01):
     return dhard, dnear, dfar, M
 
 
-def _auto_subject_points(d, k=3):
-    """피사체 자동 선택 포인트 — 강한 뎁스 절벽(실루엣) 안쪽 12~48px 밴드의
-    근경 몸통에서 내부점 추출. 바닥처럼 절벽 없이 이어지는 면은 자연 배제."""
+def _subject_band(d):
+    """근경 후보 밴드 — 강한 뎁스 절벽(실루엣) 주변 12~48px의 근경 픽셀.
+    바닥처럼 절벽 없이 이어지는 면은 자연 배제."""
     H, W = d.shape
     r = max(5, min(H, W) // 120)
     kk = np.ones((2 * r + 1, 2 * r + 1), np.uint8)
@@ -89,7 +89,13 @@ def _auto_subject_points(d, k=3):
     zone = (rng > 0.15).astype(np.uint8)
     ring = (cv2.dilate(zone, np.ones((97, 97), np.uint8)) -
             cv2.dilate(zone, np.ones((25, 25), np.uint8)))
-    cand = ((d > np.percentile(d, 75)) & (ring > 0)).astype(np.uint8)
+    return ((d > np.percentile(d, 75)) & (ring > 0)).astype(np.uint8)
+
+
+def _auto_subject_points(d, k=3):
+    """피사체 자동 선택 포인트 — 근경 밴드의 최대 덩어리(중앙 가중)에서 내부점 추출."""
+    H, W = d.shape
+    cand = _subject_band(d)
     n, lab, st, cent = cv2.connectedComponentsWithStats(cand, 8)
     best, bs = None, -1.0
     for l in range(1, n):
@@ -112,27 +118,64 @@ def _auto_subject_points(d, k=3):
     return pts
 
 
-def sam2_subject_mattes(frames, d0, dev):
+def sam2_subject_mattes(frames, d0, dev, pts=None, neg=None):
     """SAM2 비디오 전파(시간축 메모리 → 프레임 간 안정) + ViTMatte(트라이맵 매팅
     → 머리카락/털 낱올 알파). 피사체 경계 밴드의 (알파, 밴드가중) 리스트 반환.
+    pts/neg(수동 클릭 포인트, 원본 해상도 좌표)가 있으면 자동 선택을 건너뛴다.
     실패/피사체 없음 → None (가이디드 매트 폴백)."""
     import torch
     from transformers import (Sam2VideoModel, Sam2VideoProcessor,
                               VitMatteForImageMatting, VitMatteImageProcessor)
     from PIL import Image
-    pts = _auto_subject_points(d0)
-    if not pts:
-        return None
-    H, W = d0.shape
+    manual = bool(pts)
+    if not manual:
+        pts = _auto_subject_points(d0)
+        if not pts:
+            return None
+    pts = [list(p) for p in pts]
+    neg = [list(p) for p in (neg or [])]
+    H, W = frames[0].shape[:2]
     rgb = [cv2.cvtColor(f, cv2.COLOR_BGR2RGB) for f in frames]
     MID = "facebook/sam2.1-hiera-small"
     sproc = _hf(Sam2VideoProcessor.from_pretrained, MID)
     smodel = _hf(Sam2VideoModel.from_pretrained, MID, dtype=torch.bfloat16).to(dev).eval()
     sess = sproc.init_video_session(video=rgb, inference_device=dev, dtype=torch.bfloat16)
-    sproc.add_inputs_to_inference_session(sess, frame_idx=0, obj_ids=1,
-                                          input_points=[[pts]],
-                                          input_labels=[[[1] * len(pts)]])
-    smodel(inference_session=sess, frame_idx=0)
+
+    def _prompt():
+        ap = pts + neg
+        sproc.add_inputs_to_inference_session(sess, frame_idx=0, obj_ids=1,
+                                              input_points=[[ap]],
+                                              input_labels=[[[1] * len(pts) + [0] * len(neg)]])
+    _prompt()
+    if manual:
+        smodel(inference_session=sess, frame_idx=0)
+    else:
+        # 커버리지 보강 — 초기 점이 한 부위(예: 갑옷)에 몰리면 SAM2가 부위 마스크만
+        # 반환해 얼굴 등이 잘린다. 근경 밴드 중 마스크 인접 미커버 영역에 점을
+        # 추가해 인물 전체 마스크로 승격시킨다.
+        band0 = _subject_band(d0)
+        for _ in range(3):
+            o0 = smodel(inference_session=sess, frame_idx=0)
+            m0 = (sproc.post_process_masks([o0.pred_masks],
+                  original_sizes=[[H, W]])[0][0, 0] > 0).cpu().numpy().astype(np.uint8)
+            near = cv2.dilate(m0, np.ones((151, 151), np.uint8))
+            miss = ((band0 > 0) & (near > 0) &
+                    (cv2.dilate(m0, np.ones((25, 25), np.uint8)) == 0)).astype(np.uint8)
+            n2, lab2, st2, _c = cv2.connectedComponentsWithStats(miss, 8)
+            big = sorted((l for l in range(1, n2)
+                          if st2[l, cv2.CC_STAT_AREA] >= H * W * 0.004),
+                         key=lambda l: -st2[l, cv2.CC_STAT_AREA])
+            add = []
+            for l in big[:2]:
+                dt = cv2.distanceTransform((lab2 == l).astype(np.uint8), cv2.DIST_L2, 5)
+                y, x = np.unravel_index(np.argmax(dt), dt.shape)
+                if dt[y, x] >= 4:
+                    add.append([int(x), int(y)])
+            if not add:
+                break
+            pts = pts + add
+            print(f"SAMPT {len(pts)}", flush=True)
+            _prompt()
     masks = {}
     for o in smodel.propagate_in_video_iterator(sess):
         mk = sproc.post_process_masks([o.pred_masks], original_sizes=[[H, W]])[0]
@@ -169,7 +212,53 @@ def sam2_subject_mattes(frames, d0, dev):
     return out
 
 
+def serve_points():
+    """실시간 포인트 미리보기 서버 — 배경 제거 탭이 점을 찍을 때마다 현재
+    프레임의 SAM2 이미지 마스크를 즉시 계산해 돌려준다 (전파/매팅 없음).
+    stdin 프로토콜(탭 구분): SEG\t<frame.npy>\t<mask.npy>\t<pts x,y;..|->\t<neg|->
+    응답: 모델 로드 완료 시 READY 1회, 이후 요청마다 OK 또는 ERR <msg>."""
+    import torch
+    from transformers import Sam2Model, Sam2Processor
+    from PIL import Image
+    dev = "cuda" if torch.cuda.is_available() else "cpu"
+    MID = "facebook/sam2.1-hiera-small"
+    proc = _hf(Sam2Processor.from_pretrained, MID)
+    model = _hf(Sam2Model.from_pretrained, MID).to(dev).eval()
+    print("READY", flush=True)
+    for line in sys.stdin:
+        try:
+            f = line.rstrip("\n").split("\t")
+            if f[0] != "SEG" or len(f) < 5:
+                continue
+            img = np.load(f[1])                    # BGR uint8
+            H, W = img.shape[:2]
+            pp = [[int(v) for v in p.split(",")] for p in f[3].split(";") if p and p != "-"]
+            nn = [[int(v) for v in p.split(",")] for p in f[4].split(";") if p and p != "-"]
+            if not pp:
+                np.save(f[2], np.zeros((H, W), np.uint8))
+                print("OK", flush=True)
+                continue
+            pil = Image.fromarray(cv2.cvtColor(img, cv2.COLOR_BGR2RGB))
+            inp = proc(images=pil, input_points=[[pp + nn]],
+                       input_labels=[[[1] * len(pp) + [0] * len(nn)]],
+                       return_tensors="pt").to(dev)
+            with torch.no_grad():
+                o = model(**inp, multimask_output=False)
+            pm = o.pred_masks.float().cpu()
+            while pm.dim() > 3:                    # (…,M,h,w) → (M,h,w)
+                pm = pm[0]
+            m = torch.nn.functional.interpolate(pm[None], size=(H, W), mode="bilinear",
+                                                align_corners=False)[0, 0]
+            np.save(f[2], (m > 0).numpy().astype(np.uint8) * 255)
+            print("OK", flush=True)
+        except Exception as e:
+            print(f"ERR {e}", flush=True)
+
+
 def main():
+    if "--serve" in sys.argv:
+        serve_points()
+        return
     src = sys.argv[1]
     out = sys.argv[2]
     import torch
@@ -188,16 +277,30 @@ def main():
     if "--size" in sys.argv:
         size = int(sys.argv[sys.argv.index("--size") + 1])
 
+    def _parse_pts(flag):
+        """--pts/--neg "x,y;x,y" → [[x,y],...] (원본 해상도 좌표)"""
+        if flag not in sys.argv:
+            return None
+        s = sys.argv[sys.argv.index(flag) + 1]
+        return [[int(float(v)) for v in p.split(",")] for p in s.split(";") if p]
+    upts = _parse_pts("--pts")
+    uneg = _parse_pts("--neg")
+    matteonly = "--matteonly" in sys.argv   # 배경 제거 탭: 비디오 뎁스 생략
+    if matteonly:
+        model_key = "small"                 # 자동 포인트용 프레임0 뎁스만 필요
+
     from transformers import AutoImageProcessor, AutoModelForDepthEstimation
     MODELS = {"small": "depth-anything/Depth-Anything-V2-Small-hf",
               "base": "depth-anything/Depth-Anything-V2-Base-hf",
               "large": "depth-anything/Depth-Anything-V2-Large-hf"}
-    print(f"LOAD {MODELS[model_key]} {dev} {size}px", flush=True)
-    proc = _hf(AutoImageProcessor.from_pretrained, MODELS[model_key],
-               size={"height": size, "width": size})
-    model = _hf(AutoModelForDepthEstimation.from_pretrained, MODELS[model_key]).to(dev).eval()
-    if dev == "cuda":
-        model = model.half()
+    proc = model = None
+    if not (matteonly and upts):
+        print(f"LOAD {MODELS[model_key]} {dev} {size}px", flush=True)
+        proc = _hf(AutoImageProcessor.from_pretrained, MODELS[model_key],
+                   size={"height": size, "width": size})
+        model = _hf(AutoModelForDepthEstimation.from_pretrained, MODELS[model_key]).to(dev).eval()
+        if dev == "cuda":
+            model = model.half()
 
     cap = cv2.VideoCapture(src)
     W = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
@@ -215,6 +318,46 @@ def main():
     if N == 0:
         print("ERR no frames", flush=True); sys.exit(1)
     print(f"FRAMES {N} {W}x{H}", flush=True)
+
+    if matteonly:
+        # 배경 제거 탭 전용 고속 경로 — 비디오 뎁스/안정화/refine 전부 생략,
+        # SAM2 전파 + ViTMatte 매팅만 수행해 salpha/smask를 저장한다.
+        d0 = None
+        if not upts:
+            rgb0 = cv2.cvtColor(frames[0], cv2.COLOR_BGR2RGB)
+            inp = proc(images=[rgb0], return_tensors="pt").to(dev)
+            if dev == "cuda":
+                inp = {k: (v.half() if v.dtype == torch.float32 else v)
+                       for k, v in inp.items()}
+            with torch.no_grad():
+                dd = model(**inp).predicted_depth
+            dd = torch.nn.functional.interpolate(
+                dd[:, None].float(), size=(H, W),
+                mode="bicubic", align_corners=False)[0, 0].cpu().numpy()
+            lo0, hi0 = np.percentile(dd, 1), np.percentile(dd, 99)
+            d0 = np.clip((dd - lo0) / (hi0 - lo0 + 1e-6), 0, 1).astype(np.float32)
+            del model
+            if dev == "cuda":
+                torch.cuda.empty_cache()
+        try:
+            print("SAM", flush=True)
+            sm = sam2_subject_mattes(frames, d0, dev, pts=upts, neg=uneg)
+        except Exception as e:
+            print(f"SAMSKIP {e}", flush=True)
+            sm = None
+        extra = {}
+        if sm is not None and any(s is not None for s in sm):
+            smask = np.zeros((N, H, W), np.uint8)
+            salpha = np.zeros((N, H, W), np.uint8)
+            for i in range(N):
+                if sm[i] is not None:
+                    smask[i] = sm[i][2]
+                    salpha[i] = (sm[i][0] * 255.0 + 0.5).astype(np.uint8)
+            extra = {"smask": smask, "salpha": salpha}
+        np.savez_compressed(out, fps=np.float32(fps), n=np.int32(N),
+                            h=np.int32(H), w=np.int32(W), **extra)
+        print(f"DONE {out}", flush=True)
+        return
 
     depths = None
     if "--novda" not in sys.argv and dev == "cuda":

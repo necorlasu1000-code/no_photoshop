@@ -12,6 +12,7 @@ import os
 import shutil
 import subprocess
 import sys
+import tempfile
 import queue
 import threading
 import time
@@ -4197,13 +4198,16 @@ def run_gui(initial_files):
         page.place(x=0, y=0, relwidth=1, relheight=1)
         B = {"frames": None, "matte": None, "smask": None, "N": 0, "fps": 24.0,
              "src": None, "busy": False, "cur": 0, "photo": None,
-             "mode": "alpha", "color": (64, 177, 0)}
+             "mode": "alpha", "color": (64, 177, 0), "pts": [], "neg": [],
+             "view": "result", "pmask": None, "pmask_i": -1}
 
         wrap = tk.Frame(page, bg=COL["bg"])
         wrap.pack(fill="both", expand=True, padx=22, pady=14)
         tk.Label(wrap, justify="left", bg=COL["bg"], fg=COL["sub"], font=(FONT, 10),
                  text="피사체(인물)만 남기고 배경을 제거합니다 — SAM2+매팅 기반, 로토 작업 불필요. "
-                      "투명(ProRes 4444 알파)으로 뽑아 프리미어에 바로 얹거나, 임의 색 배경으로 합성합니다."
+                      "투명(ProRes 4444 알파)으로 뽑아 프리미어에 바로 얹거나, 임의 색 배경으로 합성합니다.\n"
+                      "잘못 잡히면(얼굴 잘림 등): Tab(원본 보기)으로 전환 → 마스크 외곽선을 보며 "
+                      "살릴 곳 클릭(＋) · 지울 곳 우클릭(×) → [다시 인식]"
                  ).pack(anchor="w", pady=(0, 8))
         top = tk.Frame(wrap, bg=COL["bg"]); top.pack(fill="x")
         status = tk.Label(top, text="영상을 드래그하거나 [영상 열기]", bg=COL["bg"],
@@ -4227,19 +4231,37 @@ def run_gui(initial_files):
                 return
             i = B["cur"]
             img = B["frames"][i].astype(np.float32) / 255.0
-            a, rgb = _bgrm_alpha(i, img)
             h, w = img.shape[:2]
             pw = PV2; ph = int(round(pw * h / w))
-            aP = cv2.resize(a, (pw, ph), interpolation=cv2.INTER_AREA)[..., None]
-            rP = cv2.resize(rgb, (pw, ph), interpolation=cv2.INTER_AREA)
-            if B["mode"] == "alpha":               # 투명 미리보기 = 체커보드
-                yy, xx = np.mgrid[0:ph, 0:pw]
-                chk = (((yy // 12) + (xx // 12)) % 2).astype(np.float32)
-                bg = (0.28 + 0.14 * chk)[..., None].repeat(3, 2)
-            else:
-                bg = np.empty((ph, pw, 3), np.float32)
-                bg[:] = np.array(B["color"], np.float32)[::-1] / 255.0
-            comp = np.clip((rP * aP + bg * (1.0 - aP)) * 255.0, 0, 255).astype(np.uint8)
+            has_m = B["matte"] is not None and i < len(B["matte"])
+            if has_m and B["view"] == "result":
+                a, rgb = _bgrm_alpha(i, img)
+                aP = cv2.resize(a, (pw, ph), interpolation=cv2.INTER_AREA)[..., None]
+                rP = cv2.resize(rgb, (pw, ph), interpolation=cv2.INTER_AREA)
+                if B["mode"] == "alpha":           # 투명 미리보기 = 체커보드
+                    yy, xx = np.mgrid[0:ph, 0:pw]
+                    chk = (((yy // 12) + (xx // 12)) % 2).astype(np.float32)
+                    bg = (0.28 + 0.14 * chk)[..., None].repeat(3, 2)
+                else:
+                    bg = np.empty((ph, pw, 3), np.float32)
+                    bg[:] = np.array(B["color"], np.float32)[::-1] / 255.0
+                comp = np.clip((rP * aP + bg * (1.0 - aP)) * 255.0, 0, 255).astype(np.uint8)
+            else:                                  # 원본 보기(Tab) / 인식 전 — 점 찍기용
+                comp = np.clip(cv2.resize(img, (pw, ph), interpolation=cv2.INTER_AREA)
+                               * 255.0, 0, 255).astype(np.uint8)
+                pm = (B["pmask"] if B["pmask"] is not None and B["pmask_i"] == i
+                      else None)
+                mk = None
+                if pm is not None:                 # 실시간 점 미리보기 마스크 우선
+                    mk = (cv2.resize(pm, (pw, ph),
+                                     interpolation=cv2.INTER_AREA) > 127).astype(np.uint8)
+                elif has_m:
+                    mk = (cv2.resize(_bgrm_a(i), (pw, ph),
+                                     interpolation=cv2.INTER_AREA) > 0.5).astype(np.uint8)
+                if mk is not None:                 # 마스크 외곽선 (AE 마스크처럼)
+                    cs = cv2.findContours(mk, cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE)[0]
+                    cv2.polylines(comp, cs, True, (20, 20, 20), 3, cv2.LINE_AA)
+                    cv2.polylines(comp, cs, True, (94, 242, 214), 1, cv2.LINE_AA)
             ok2, buf = cv2.imencode(".ppm", comp)
             if not ok2:
                 return
@@ -4247,13 +4269,27 @@ def run_gui(initial_files):
             prev.configure(height=ph)
             prev.delete("all")
             prev.create_image(pw / 2, ph / 2, image=B["photo"])
+            for x, y in B["pts"]:                  # 수동 포인트 마커
+                cx, cy = x * pw / w, y * ph / h
+                prev.create_oval(cx - 6, cy - 6, cx + 6, cy + 6,
+                                 outline=COL["lime"], width=2)
+                prev.create_line(cx - 3, cy, cx + 3, cy, fill=COL["lime"])
+                prev.create_line(cx, cy - 3, cx, cy + 3, fill=COL["lime"])
+            for x, y in B["neg"]:
+                cx, cy = x * pw / w, y * ph / h
+                prev.create_line(cx - 5, cy - 5, cx + 5, cy + 5, fill=COL["err"], width=2)
+                prev.create_line(cx - 5, cy + 5, cx + 5, cy - 5, fill=COL["err"], width=2)
             frm2.configure(text=f"{i+1}/{B['N']}")
 
-        def _bgrm_alpha(i, img01):
-            """전체 알파(내부=1, 밴드=매트, 밖=0) + 경계 디스필 색(F 추정)"""
+        def _bgrm_a(i):
+            """전체 알파(내부=1, 밴드=매트, 밖=0)"""
             a = B["matte"][i].astype(np.float32) / 255.0   # ViTMatte 전체 알파(salpha)
             dil = cv2.dilate(B["smask"][i], np.ones((73, 73), np.uint8))
-            a = np.clip(np.where(dil > 0, a, 0.0), 0.0, 1.0).astype(np.float32)
+            return np.clip(np.where(dil > 0, a, 0.0), 0.0, 1.0).astype(np.float32)
+
+        def _bgrm_alpha(i, img01):
+            """전체 알파 + 경계 디스필 색(F 추정)"""
+            a = _bgrm_a(i)
             # 디스필: 반투명 경계의 색에서 원본 배경 오염 제거 (순수 전경색 외삽)
             wF = np.clip((a - 0.7) / 0.3, 0.0, 1.0)
             k61 = (61, 61)
@@ -4283,6 +4319,60 @@ def run_gui(initial_files):
                     render_pv()
         colbox.bind("<Button-1>", pick_color)
 
+        redo_btn = canvas_button(ctl, "다시 인식", 100, 30, primary=False)
+        redo_btn.pack(side="left", padx=(0, 6))
+        redo_btn.bind("<Button-1>", lambda e: rerun())
+        clr_btn = canvas_button(ctl, "점 초기화", 90, 30, primary=False)
+        clr_btn.pack(side="left")
+        view_btn = canvas_button(ctl, "원본 보기 (Tab)", 130, 30, primary=False)
+        view_btn.pack(side="left", padx=(6, 0))
+
+        def toggle_view(_=None):
+            if B["frames"] is None:
+                return
+            B["view"] = "orig" if B["view"] == "result" else "result"
+            view_btn.set_text("결과 보기 (Tab)" if B["view"] == "orig" else "원본 보기 (Tab)")
+            render_pv()
+        view_btn.bind("<Button-1>", lambda e: toggle_view())
+
+        def on_tab6(e):
+            if current["idx"] != 6:                # 배경 제거 탭에서만
+                return
+            toggle_view()
+            return "break"
+        root.bind("<Tab>", on_tab6, add="+")
+
+        def clear_pts(_=None):
+            if B["busy"]:
+                return
+            B["pts"] = []; B["neg"] = []
+            B["pmask"] = None; B["pmask_i"] = -1
+            status.configure(text="점 초기화 — [다시 인식]을 누르면 자동 인식으로 돌아갑니다",
+                             fg=COL["sub"])
+            render_pv()
+        clr_btn.bind("<Button-1>", clear_pts)
+
+        def _pv_click(ev, keep):
+            """미리보기 클릭 → 원본 해상도 좌표의 수동 피사체 포인트 추가"""
+            if B["frames"] is None or B["busy"]:
+                return
+            h, w = B["frames"][0].shape[:2]
+            ph = int(round(PV2 * h / w))
+            x = int(round(ev.x * w / PV2))
+            y = int(round(ev.y * h / ph))
+            if not (0 <= x < w and 0 <= y < h):
+                return
+            (B["pts"] if keep else B["neg"]).append([x, y])
+            if B["view"] == "result":              # 점 찍기 = 원본 보기로 자동 전환
+                B["view"] = "orig"
+                view_btn.set_text("결과 보기 (Tab)")
+            status.configure(text=f"점 {len(B['pts']) + len(B['neg'])}개 — [다시 인식]으로 반영",
+                             fg=COL["sub"])
+            render_pv()
+            _pv_seg_request()                      # 실시간 외곽선 미리보기
+        prev.bind("<Button-1>", lambda e: _pv_click(e, True))
+        prev.bind("<Button-3>", lambda e: _pv_click(e, False))
+
         rend_btn = canvas_button(ctl, "렌더", 90, 30, primary=True)
         rend_btn.pack(side="right")
         open2 = canvas_button(top, "영상 열기", 90, 30, primary=True)
@@ -4307,6 +4397,121 @@ def run_gui(initial_files):
                  else os.path.dirname(os.path.abspath(__file__)))
             return os.path.join(d, "depth_extract.py")
 
+        # ---- 실시간 점 미리보기 (SAM2 이미지 서버 상주) ----
+        SRV = {"p": None, "ready": False, "pending": None, "thread": None, "fsent": None}
+        pv_img = os.path.join(tempfile.gettempdir(), "nps_bgrm_frame.npy")
+        pv_msk = os.path.join(tempfile.gettempdir(), "nps_bgrm_mask.npy")
+
+        def _srv_ensure():
+            if SRV["p"] is not None and SRV["p"].poll() is None:
+                return True
+            try:
+                SRV["p"] = subprocess.Popen(
+                    [py2(), script2(), "--serve"],
+                    stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                    stderr=subprocess.DEVNULL, text=True,
+                    creationflags=(0x08000000 if os.name == "nt" else 0))
+                SRV["ready"] = False
+                SRV["fsent"] = None
+                return True
+            except Exception:
+                SRV["p"] = None
+                return False
+
+        def _pv_seg_request():
+            """현재 점으로 현재 프레임 마스크를 백그라운드 계산 (최신 요청만 유지)."""
+            if B["frames"] is None:
+                return
+            SRV["pending"] = (B["cur"], list(B["pts"]), list(B["neg"]))
+            if SRV["thread"] is not None and SRV["thread"].is_alive():
+                return
+
+            def work():
+                if not _srv_ensure():
+                    return
+                p = SRV["p"]
+                try:
+                    if not SRV["ready"]:
+                        root.after(0, lambda: status.configure(
+                            text="실시간 미리보기 준비 중 (최초 1회) …", fg=COL["sub"]))
+                        if not p.stdout.readline():        # READY 대기 (모델 로드)
+                            return
+                        SRV["ready"] = True
+                    while SRV["pending"] is not None:
+                        i2, pp, nn = SRV["pending"]
+                        SRV["pending"] = None
+                        if SRV["fsent"] != i2:
+                            np.save(pv_img, B["frames"][i2])
+                            SRV["fsent"] = i2
+                        ps = ";".join(f"{x},{y}" for x, y in pp) or "-"
+                        ns = ";".join(f"{x},{y}" for x, y in nn) or "-"
+                        p.stdin.write(f"SEG\t{pv_img}\t{pv_msk}\t{ps}\t{ns}\n")
+                        p.stdin.flush()
+                        resp = (p.stdout.readline() or "").strip()
+                        if not resp.startswith("OK"):
+                            continue
+                        try:
+                            mk = np.load(pv_msk)
+                        except Exception:
+                            continue
+                        B["pmask"] = mk
+                        B["pmask_i"] = i2
+                        root.after(0, lambda: (status.configure(
+                            text="미리보기 갱신 — 전체 프레임 적용은 [다시 인식]",
+                            fg=COL["sub"]), render_pv()))
+                except Exception:
+                    pass
+            SRV["thread"] = threading.Thread(target=work, daemon=True)
+            SRV["thread"].start()
+
+        def _run_recog():
+            """SAM2+매팅 인식 서브프로세스 실행 + 결과 로드 (작업 스레드에서 호출).
+            B['pts']/B['neg']가 있으면 수동 포인트로, 없으면 자동 인식."""
+            path = B["src"]
+            tmp = os.path.join(os.path.dirname(os.path.abspath(path)), "._bgrm_depth.npz")
+            cmd = [py2(), script2(), path, tmp, "--matteonly"]
+            if B["pts"]:
+                cmd += ["--pts", ";".join(f"{x},{y}" for x, y in B["pts"])]
+            if B["neg"]:
+                cmd += ["--neg", ";".join(f"{x},{y}" for x, y in B["neg"])]
+            pr = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                  text=True, creationflags=(0x08000000 if os.name == "nt" else 0))
+            for line in pr.stdout:
+                line = line.strip()
+                if line.startswith("MATTE"):
+                    root.after(0, lambda l=line: status.configure(text=f"매팅 {l.split()[1]}"))
+                elif line.startswith("SAM"):
+                    root.after(0, lambda: status.configure(text="피사체 분리(SAM2) …"))
+                elif line.startswith(("LOAD", "FRAMES")):
+                    root.after(0, lambda: status.configure(text="피사체 인식 …"))
+            pr.wait()
+            if pr.returncode != 0 or not os.path.exists(tmp):
+                raise RuntimeError("인식 실패 (포커싱 탭에서 AI 구성요소를 먼저 설치하세요)")
+            z = np.load(tmp)
+            if "salpha" not in z.files:
+                try:
+                    os.remove(tmp)
+                except Exception:
+                    pass
+                raise RuntimeError("피사체를 못 찾음 — 미리보기에서 피사체를 클릭 후 [다시 인식]")
+            matte = z["salpha"]; smask = z["smask"]; N = int(z["n"])
+            try:
+                os.remove(tmp)
+            except Exception:
+                pass
+            B.update({"matte": matte, "smask": smask, "N": N,
+                      "cur": min(B["cur"], N - 1)})
+
+            def done():
+                sc2.configure(to=N - 1); pos2.set(B["cur"])
+                B["view"] = "result"
+                B["pmask"] = None; B["pmask_i"] = -1
+                view_btn.set_text("원본 보기 (Tab)")
+                status.configure(text=f"준비완료 · {N}프레임 · 확인 후 [렌더] — 잘렸으면 "
+                                      f"Tab(원본 보기)에서 클릭 보정", fg=COL["ok"])
+                render_pv()
+            root.after(0, done)
+
         def load2(path):
             if B["busy"]:
                 return
@@ -4326,37 +4531,31 @@ def run_gui(initial_files):
                     cap.release()
                     if not frames:
                         raise RuntimeError("프레임 없음")
-                    tmp = os.path.join(os.path.dirname(os.path.abspath(path)), "._bgrm_depth.npz")
-                    pr = subprocess.Popen([py2(), script2(), path, tmp],
-                                          stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                                          text=True, creationflags=(0x08000000 if os.name == "nt" else 0))
-                    for line in pr.stdout:
-                        line = line.strip()
-                        if line.startswith("PROG"):
-                            root.after(0, lambda l=line: status.configure(text=f"피사체 인식 {l.split()[1]}"))
-                        elif line.startswith("MATTE"):
-                            root.after(0, lambda l=line: status.configure(text=f"매팅 {l.split()[1]}"))
-                        elif line.startswith("SAM"):
-                            root.after(0, lambda: status.configure(text="피사체 분리(SAM2) …"))
-                    pr.wait()
-                    if pr.returncode != 0 or not os.path.exists(tmp):
-                        raise RuntimeError("인식 실패 (포커싱 탭에서 AI 구성요소를 먼저 설치하세요)")
-                    z = np.load(tmp)
-                    if "salpha" not in z.files:
-                        raise RuntimeError("피사체를 찾지 못했습니다")
-                    matte = z["salpha"]; smask = z["smask"]; N = int(z["n"])
-                    try:
-                        os.remove(tmp)
-                    except Exception:
-                        pass
-                    B.update({"frames": frames, "matte": matte, "smask": smask,
-                              "N": N, "fps": fps, "src": path, "cur": 0})
+                    B.update({"frames": frames, "matte": None, "smask": None,
+                              "N": len(frames), "fps": fps, "src": path,
+                              "cur": 0, "pts": [], "neg": [], "view": "result",
+                              "pmask": None, "pmask_i": -1})
+                    SRV["fsent"] = None
+                    root.after(0, lambda: (sc2.configure(to=len(frames) - 1),
+                                           pos2.set(0),
+                                           view_btn.set_text("원본 보기 (Tab)"),
+                                           render_pv()))
+                    _run_recog()
+                except Exception as e:
+                    root.after(0, lambda: status.configure(text=f"실패: {e}", fg=COL["err"]))
+                finally:
+                    B["busy"] = False
+            threading.Thread(target=work, daemon=True).start()
 
-                    def done():
-                        sc2.configure(to=N - 1); pos2.set(0)
-                        status.configure(text=f"준비완료 · {N}프레임 · 미리보기 확인 후 [렌더]", fg=COL["ok"])
-                        render_pv()
-                    root.after(0, done)
+        def rerun():
+            if B["frames"] is None or B["busy"]:
+                return
+            B["busy"] = True
+            status.configure(text="다시 인식 중 …", fg=COL["sub"])
+
+            def work():
+                try:
+                    _run_recog()
                 except Exception as e:
                     root.after(0, lambda: status.configure(text=f"실패: {e}", fg=COL["err"]))
                 finally:
@@ -4364,7 +4563,7 @@ def run_gui(initial_files):
             threading.Thread(target=work, daemon=True).start()
 
         def do_render2():
-            if B["frames"] is None or B["busy"]:
+            if B["frames"] is None or B["matte"] is None or B["busy"]:
                 return
             B["busy"] = True
             status.configure(text="렌더 중 …", fg=COL["sub"])
