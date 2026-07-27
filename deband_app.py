@@ -24,7 +24,7 @@ import cv2
 EXTS = (".png", ".jpg", ".jpeg", ".webp", ".bmp", ".tif", ".tiff")
 VEXTS = (".mp4", ".mov", ".avi", ".mkv", ".webm")
 APP_TITLE = "no photoshop — 이미지 후처리"
-APP_VER = "ver 1.4.1"
+APP_VER = "ver 1.5"
 
 UPDATE_REPO = "necorlasu1000-code/no_photoshop"
 
@@ -1421,8 +1421,9 @@ def run_gui(initial_files):
     tabbar.pack(fill="x", padx=24, pady=(18, 0))
     pages = {}
     current = {"idx": 0}
-    TABS = ["밴딩 제거", "실사 질감", "Remove GPT", "우글거림 수정", "디테일 보강", "포커싱"]
-    MAIN_TABS = [0, 5]                      # 메인 노출: 밴딩 제거 · 포커싱
+    TABS = ["밴딩 제거", "실사 질감", "Remove GPT", "우글거림 수정", "디테일 보강", "포커싱",
+            "배경 제거"]
+    MAIN_TABS = [0, 5, 6]                   # 메인 노출: 밴딩 제거 · 포커싱 · 배경 제거
     LEGACY_TABS = [1, 2, 3, 4]              # 레거시 메뉴로 이동
     TAB_W, TAB_H, PILL_PAD = 106, 40, 4
 
@@ -4190,6 +4191,256 @@ def run_gui(initial_files):
         page.add_files = lambda files: (files and load_video(files[0]))
         return page
 
+
+    def build_bgrm_page():
+        page = tk.Frame(body, bg=COL["bg"])
+        page.place(x=0, y=0, relwidth=1, relheight=1)
+        B = {"frames": None, "matte": None, "smask": None, "N": 0, "fps": 24.0,
+             "src": None, "busy": False, "cur": 0, "photo": None,
+             "mode": "alpha", "color": (64, 177, 0)}
+
+        wrap = tk.Frame(page, bg=COL["bg"])
+        wrap.pack(fill="both", expand=True, padx=22, pady=14)
+        tk.Label(wrap, justify="left", bg=COL["bg"], fg=COL["sub"], font=(FONT, 10),
+                 text="피사체(인물)만 남기고 배경을 제거합니다 — SAM2+매팅 기반, 로토 작업 불필요. "
+                      "투명(ProRes 4444 알파)으로 뽑아 프리미어에 바로 얹거나, 임의 색 배경으로 합성합니다."
+                 ).pack(anchor="w", pady=(0, 8))
+        top = tk.Frame(wrap, bg=COL["bg"]); top.pack(fill="x")
+        status = tk.Label(top, text="영상을 드래그하거나 [영상 열기]", bg=COL["bg"],
+                          fg=COL["dim"], font=(MONO, 10)); status.pack(side="left")
+
+        PV2 = 720
+        prev = tk.Canvas(wrap, width=PV2, height=int(PV2 * 9 / 16), bg="#0a0b0c",
+                         highlightthickness=1, highlightbackground=COL["border"])
+        prev.pack(pady=10)
+
+        ctl = tk.Frame(wrap, bg=COL["bg"]); ctl.pack(fill="x")
+        mode_btn = canvas_button(ctl, "배경: 투명(4444)", 150, 30, primary=False)
+        mode_btn.pack(side="left", padx=(0, 6))
+        colbox = tk.Canvas(ctl, width=30, height=30, bg="#00b140",
+                           highlightthickness=1, highlightbackground=COL["border"])
+        colbox.pack(side="left", padx=(0, 14))
+        pos2 = tk.IntVar(value=0)
+
+        def render_pv():
+            if B["frames"] is None:
+                return
+            i = B["cur"]
+            img = B["frames"][i].astype(np.float32) / 255.0
+            a, rgb = _bgrm_alpha(i, img)
+            h, w = img.shape[:2]
+            pw = PV2; ph = int(round(pw * h / w))
+            aP = cv2.resize(a, (pw, ph), interpolation=cv2.INTER_AREA)[..., None]
+            rP = cv2.resize(rgb, (pw, ph), interpolation=cv2.INTER_AREA)
+            if B["mode"] == "alpha":               # 투명 미리보기 = 체커보드
+                yy, xx = np.mgrid[0:ph, 0:pw]
+                chk = (((yy // 12) + (xx // 12)) % 2).astype(np.float32)
+                bg = (0.28 + 0.14 * chk)[..., None].repeat(3, 2)
+            else:
+                bg = np.empty((ph, pw, 3), np.float32)
+                bg[:] = np.array(B["color"], np.float32)[::-1] / 255.0
+            comp = np.clip((rP * aP + bg * (1.0 - aP)) * 255.0, 0, 255).astype(np.uint8)
+            ok2, buf = cv2.imencode(".ppm", comp)
+            if not ok2:
+                return
+            B["photo"] = tk.PhotoImage(data=buf.tobytes())
+            prev.configure(height=ph)
+            prev.delete("all")
+            prev.create_image(pw / 2, ph / 2, image=B["photo"])
+            frm2.configure(text=f"{i+1}/{B['N']}")
+
+        def _bgrm_alpha(i, img01):
+            """전체 알파(내부=1, 밴드=매트, 밖=0) + 경계 디스필 색(F 추정)"""
+            a = B["matte"][i].astype(np.float32) / 255.0   # ViTMatte 전체 알파(salpha)
+            dil = cv2.dilate(B["smask"][i], np.ones((73, 73), np.uint8))
+            a = np.clip(np.where(dil > 0, a, 0.0), 0.0, 1.0).astype(np.float32)
+            # 디스필: 반투명 경계의 색에서 원본 배경 오염 제거 (순수 전경색 외삽)
+            wF = np.clip((a - 0.7) / 0.3, 0.0, 1.0)
+            k61 = (61, 61)
+            Fx = (cv2.boxFilter(img01 * wF[..., None], -1, k61) /
+                  np.maximum(cv2.boxFilter(wF, -1, k61), 1e-4)[..., None])
+            np.clip(Fx, 0.0, 1.0, out=Fx)
+            t = np.clip((a - 0.2) / 0.6, 0.0, 1.0)[..., None]
+            rgb = img01 * t + Fx * (1.0 - t)
+            return a, rgb
+
+        def toggle_mode():
+            B["mode"] = "color" if B["mode"] == "alpha" else "alpha"
+            mode_btn.set_text("배경: 투명(4444)" if B["mode"] == "alpha" else "배경: 색상")
+            render_pv()
+        mode_btn.bind("<Button-1>", lambda e: toggle_mode())
+
+        def pick_color(_=None):
+            from tkinter import colorchooser
+            c = colorchooser.askcolor(color="#%02x%02x%02x" % B["color"],
+                                      title="배경 색 선택")
+            if c and c[0]:
+                B["color"] = tuple(int(v) for v in c[0])
+                colbox.configure(bg="#%02x%02x%02x" % B["color"])
+                if B["mode"] == "alpha":
+                    toggle_mode()
+                else:
+                    render_pv()
+        colbox.bind("<Button-1>", pick_color)
+
+        rend_btn = canvas_button(ctl, "렌더", 90, 30, primary=True)
+        rend_btn.pack(side="right")
+        open2 = canvas_button(top, "영상 열기", 90, 30, primary=True)
+        open2.pack(side="right")
+
+        tl2 = tk.Frame(wrap, bg=COL["bg"]); tl2.pack(fill="x", pady=(8, 0))
+        sc2 = tk.Scale(tl2, from_=0, to=0, orient="horizontal", variable=pos2,
+                       command=lambda v: (B.update(cur=int(float(v))), render_pv()),
+                       showvalue=False, length=560, bg=COL["card"], fg=COL["text"],
+                       troughcolor=COL["card2"], highlightthickness=0, bd=0)
+        sc2.pack(side="left", fill="x", expand=True, padx=(0, 8))
+        frm2 = tk.Label(tl2, text="0/0", bg=COL["bg"], fg=COL["dim"], font=(MONO, 9))
+        frm2.pack(side="left")
+
+        def py2():
+            if getattr(sys, "frozen", False):
+                return shutil.which("python") or shutil.which("py") or "python"
+            return sys.executable
+
+        def script2():
+            d = (os.path.dirname(os.path.abspath(sys.argv[0])) if getattr(sys, "frozen", False)
+                 else os.path.dirname(os.path.abspath(__file__)))
+            return os.path.join(d, "depth_extract.py")
+
+        def load2(path):
+            if B["busy"]:
+                return
+            B["busy"] = True
+            status.configure(text=f"불러오는 중: {os.path.basename(path)} …", fg=COL["sub"])
+
+            def work():
+                try:
+                    cap = cv2.VideoCapture(path)
+                    fps = cap.get(cv2.CAP_PROP_FPS) or 24.0
+                    frames = []
+                    while True:
+                        ok2, f = cap.read()
+                        if not ok2:
+                            break
+                        frames.append(f)
+                    cap.release()
+                    if not frames:
+                        raise RuntimeError("프레임 없음")
+                    tmp = os.path.join(os.path.dirname(os.path.abspath(path)), "._bgrm_depth.npz")
+                    pr = subprocess.Popen([py2(), script2(), path, tmp],
+                                          stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                          text=True, creationflags=(0x08000000 if os.name == "nt" else 0))
+                    for line in pr.stdout:
+                        line = line.strip()
+                        if line.startswith("PROG"):
+                            root.after(0, lambda l=line: status.configure(text=f"피사체 인식 {l.split()[1]}"))
+                        elif line.startswith("MATTE"):
+                            root.after(0, lambda l=line: status.configure(text=f"매팅 {l.split()[1]}"))
+                        elif line.startswith("SAM"):
+                            root.after(0, lambda: status.configure(text="피사체 분리(SAM2) …"))
+                    pr.wait()
+                    if pr.returncode != 0 or not os.path.exists(tmp):
+                        raise RuntimeError("인식 실패 (포커싱 탭에서 AI 구성요소를 먼저 설치하세요)")
+                    z = np.load(tmp)
+                    if "salpha" not in z.files:
+                        raise RuntimeError("피사체를 찾지 못했습니다")
+                    matte = z["salpha"]; smask = z["smask"]; N = int(z["n"])
+                    try:
+                        os.remove(tmp)
+                    except Exception:
+                        pass
+                    B.update({"frames": frames, "matte": matte, "smask": smask,
+                              "N": N, "fps": fps, "src": path, "cur": 0})
+
+                    def done():
+                        sc2.configure(to=N - 1); pos2.set(0)
+                        status.configure(text=f"준비완료 · {N}프레임 · 미리보기 확인 후 [렌더]", fg=COL["ok"])
+                        render_pv()
+                    root.after(0, done)
+                except Exception as e:
+                    root.after(0, lambda: status.configure(text=f"실패: {e}", fg=COL["err"]))
+                finally:
+                    B["busy"] = False
+            threading.Thread(target=work, daemon=True).start()
+
+        def do_render2():
+            if B["frames"] is None or B["busy"]:
+                return
+            B["busy"] = True
+            status.configure(text="렌더 중 …", fg=COL["sub"])
+            mode, color = B["mode"], B["color"]
+
+            def work():
+                try:
+                    ff = get_ffmpeg()
+                    src2 = B["src"]
+                    h, w = B["frames"][0].shape[:2]
+                    base2, _ = os.path.splitext(src2)
+                    flags = 0x08000000 if os.name == "nt" else 0
+                    if mode == "alpha":
+                        dst = base2 + "_bgrm.mov"
+                        cmd = [ff, "-y", "-f", "rawvideo", "-pix_fmt", "bgra",
+                               "-s", f"{w}x{h}", "-r", f"{B['fps']}", "-i", "-",
+                               "-i", src2, "-map", "0:v", "-map", "1:a?", "-c:a", "copy",
+                               "-c:v", "prores_ks", "-profile:v", "4444",
+                               "-pix_fmt", "yuva444p10le", dst]
+                    else:
+                        dst = base2 + "_bgrm.mov"
+                        cmd = [ff, "-y", "-f", "rawvideo", "-pix_fmt", "bgr24",
+                               "-s", f"{w}x{h}", "-r", f"{B['fps']}", "-i", "-",
+                               "-i", src2, "-map", "0:v", "-map", "1:a?", "-c:a", "copy",
+                               "-c:v", "prores_ks", "-profile:v", "3",
+                               "-pix_fmt", "yuv422p10le", dst]
+                    p2 = subprocess.Popen(cmd, stdin=subprocess.PIPE,
+                                          stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                                          creationflags=flags)
+                    bgc = np.array(color, np.float32)[::-1] / 255.0
+                    for i in range(B["N"]):
+                        img = B["frames"][i].astype(np.float32) / 255.0
+                        a, rgb = _bgrm_alpha(i, img)
+                        if mode == "alpha":
+                            out = np.dstack([np.clip(rgb * 255, 0, 255).astype(np.uint8),
+                                             np.clip(a * 255, 0, 255).astype(np.uint8)])
+                        else:
+                            comp = rgb * a[..., None] + bgc * (1.0 - a[..., None])
+                            out = np.clip(comp * 255, 0, 255).astype(np.uint8)
+                        p2.stdin.write(out.tobytes())
+                        if i % 5 == 0:
+                            root.after(0, lambda v=int((i + 1) / B["N"] * 100):
+                                       status.configure(text=f"렌더 중 … {v}%"))
+                    p2.stdin.close(); p2.wait()
+                    if p2.returncode != 0:
+                        raise RuntimeError("FFmpeg 인코딩 실패")
+                    root.after(0, lambda: status.configure(
+                        text=f"완료: {os.path.basename(dst)}", fg=COL["ok"]))
+                except Exception as e:
+                    root.after(0, lambda: status.configure(text=f"렌더 실패: {e}", fg=COL["err"]))
+                finally:
+                    B["busy"] = False
+            threading.Thread(target=work, daemon=True).start()
+        rend_btn.bind("<Button-1>", lambda e: do_render2())
+
+        def open_dlg2():
+            p = filedialog.askopenfilename(filetypes=[("영상", "*.mp4 *.mov *.avi *.mkv *.webm")])
+            if p:
+                load2(p)
+        open2.bind("<Button-1>", lambda e: open_dlg2())
+        if dnd_ok:
+            def on_drop2(ev):
+                try:
+                    paths = root.tk.splitlist(ev.data)
+                except Exception:
+                    paths = [ev.data]
+                if paths:
+                    load2(paths[0].strip("{}"))
+            for wdg in (page, prev):
+                try:
+                    wdg.drop_target_register(DND_FILES); wdg.dnd_bind("<<Drop>>", on_drop2)
+                except Exception:
+                    pass
+        page.add_files = lambda files: (files and load2(files[0]))
+        return page
+
     pages[0] = build_page(
         "밴딩(계단현상) 제거 — 이미지는 디테일 보존 스무딩, 영상은 여러 프레임을 "
         "스태킹해 진짜 10비트 계조를 복원(색보정 버팀). 영상은 ProRes .mov(그레이딩용)+"
@@ -4200,6 +4451,7 @@ def run_gui(initial_files):
     pages[3] = build_sizzle_page()
     pages[4] = build_detailboost_page()
     pages[5] = build_focus_page()
+    pages[6] = build_bgrm_page()
 
     current["idx"] = 0
     draw_tabs()

@@ -298,7 +298,14 @@ def main():
             except Exception as e:
                 print(f"SAMSKIP {e}", flush=True)
                 sm = None
+            smask = salpha = None
             if sm is not None:
+                smask = np.zeros((N,) + dn.shape[1:], np.uint8)
+                salpha = np.zeros((N,) + dn.shape[1:], np.uint8)   # ViTMatte 원본 알파
+                for i in range(N):
+                    if sm[i] is not None:
+                        smask[i] = sm[i][2]
+                        salpha[i] = (sm[i][0] * 255.0 + 0.5).astype(np.uint8)
                 kbox = (51, 51)
                 for i in range(N):
                     if sm[i] is None:
@@ -332,11 +339,12 @@ def main():
             mat[i] = (M * 255 + 0.5).astype(np.uint8)
             # 커밋 뎁스도 안정화된 매트 기준으로 재계산
             dn[i] = np.where(M > 0.5, dnear[i], dfar[i])
+        extra = ({"smask": smask, "salpha": salpha} if smask is not None else {})
         np.savez_compressed(out, depth=(dn * 65535 + 0.5).astype(np.uint16),
                             dnear=(dnear * 65535 + 0.5).astype(np.uint16),
                             dfar=(dfar * 65535 + 0.5).astype(np.uint16),
                             matte=mat, fps=np.float32(fps),
-                            n=np.int32(N), h=np.int32(H), w=np.int32(W))
+                            n=np.int32(N), h=np.int32(H), w=np.int32(W), **extra)
         print(f"DONE {out}", flush=True)
         return
 
