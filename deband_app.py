@@ -25,7 +25,7 @@ import cv2
 EXTS = (".png", ".jpg", ".jpeg", ".webp", ".bmp", ".tif", ".tiff")
 VEXTS = (".mp4", ".mov", ".avi", ".mkv", ".webm")
 APP_TITLE = "no photoshop — 이미지 후처리"
-APP_VER = "ver 1.6"
+APP_VER = "ver 1.7"
 
 UPDATE_REPO = "necorlasu1000-code/no_photoshop"
 
@@ -91,18 +91,21 @@ def check_update_async(root):
     threading.Thread(target=work, daemon=True).start()
 
 
+# v2 모노크롬(블랙&화이트) — 유색 액센트 없이 명도 대비로만 위계.
+# "lime" 키는 호환을 위해 유지하되 값은 화이트 프라이머리.
 COL = {
-    "bg":     "#0e0f10",
-    "card":   "#161719",
-    "card2":  "#1b1c1f",
-    "border": "#2c2e31",
-    "dash":   "#3a3d41",
-    "lime":   "#d6f25e",
-    "lime2":  "#c4e348",
-    "text":   "#e9ebed",
-    "sub":    "#9a9da1",
-    "dim":    "#6f7378",
-    "ok":     "#8fd964",
+    "bg":     "#0b0b0c",
+    "side":   "#111113",
+    "card":   "#151517",
+    "card2":  "#1e1e22",
+    "border": "#26262a",
+    "dash":   "#38383d",
+    "lime":   "#fafafa",
+    "lime2":  "#e6e6e9",
+    "text":   "#f2f2f4",
+    "sub":    "#a3a3ab",
+    "dim":    "#68686f",
+    "ok":     "#d9d9de",
     "err":    "#e07a6a",
 }
 FONT = "Malgun Gothic"
@@ -1380,6 +1383,30 @@ def run_gui(initial_files):
     import tkinter as tk
     from tkinter import filedialog, messagebox
 
+    # 고DPI 선명 렌더링: 기본 tkinter는 96DPI 가정이라 OS가 창을 비트맵 확대해
+    # 글자가 뿌옇게 보인다. DPI 인지를 선언해 실제 픽셀로 렌더하고, 대신
+    # 고정 픽셀 치수들을 ui_scale 배로 키워 물리 크기를 유지한다.
+    ui_scale = 1.0
+    if os.name == "nt":
+        try:
+            import ctypes
+            try:
+                ctypes.windll.shcore.SetProcessDpiAwareness(1)   # 시스템 DPI 인지
+            except Exception:
+                ctypes.windll.user32.SetProcessDPIAware()
+            try:
+                ui_scale = ctypes.windll.user32.GetDpiForSystem() / 96.0
+            except Exception:
+                dc = ctypes.windll.user32.GetDC(0)
+                ui_scale = ctypes.windll.gdi32.GetDeviceCaps(dc, 88) / 96.0
+                ctypes.windll.user32.ReleaseDC(0, dc)
+        except Exception:
+            ui_scale = 1.0
+
+    def UIS(v):
+        """96DPI 기준 픽셀값 → 현재 DPI 픽셀값"""
+        return int(round(v * ui_scale))
+
     dnd_ok = False
     try:
         from tkinterdnd2 import DND_FILES, TkinterDnD
@@ -1389,8 +1416,23 @@ def run_gui(initial_files):
         root = tk.Tk()
 
     root.title(APP_TITLE)
-    root.geometry("1020x780")
-    root.minsize(780, 640)
+    try:                                    # 폰트(pt)가 실제 DPI 기준으로 환산되도록
+        root.tk.call("tk", "scaling", ui_scale * 96.0 / 72.0)
+    except Exception:
+        pass
+
+    global FONT                             # Pretendard 등 설치돼 있으면 우선 사용
+    try:
+        import tkinter.font as tkfont
+        _fams = set(tkfont.families(root))
+        for _f in ("Pretendard", "Pretendard Variable", "SUIT"):
+            if _f in _fams:
+                FONT = _f
+                break
+    except Exception:
+        pass
+    root.geometry(f"{UIS(1020)}x{UIS(780)}")
+    root.minsize(UIS(780), UIS(640))
     root.configure(bg=COL["bg"])
 
     try:
@@ -1417,87 +1459,81 @@ def run_gui(initial_files):
                x1 - r, y1, x0 + r, y1, x0, y1, x0, y1 - r, x0, y0 + r, x0, y0]
         return cv.create_polygon(pts, smooth=True, **kw)
 
-    # ---------- 세그먼트 탭 ----------
-    tabbar = tk.Canvas(root, height=58, bg=COL["bg"], highlightthickness=0)
-    tabbar.pack(fill="x", padx=24, pady=(18, 0))
+    # ---------- 좌측 사이드바 (v2 모노크롬 레이아웃) ----------
+    shell = tk.Frame(root, bg=COL["bg"])
+    shell.pack(fill="both", expand=True)
+
+    side = tk.Frame(shell, bg=COL["side"], width=UIS(206))
+    side.pack(side="left", fill="y")
+    side.pack_propagate(False)
+    tk.Frame(shell, bg=COL["border"], width=1).pack(side="left", fill="y")
+
+    body = tk.Frame(shell, bg=COL["bg"])
+    body.pack(side="right", fill="both", expand=True)
+
     pages = {}
     current = {"idx": 0}
     TABS = ["밴딩 제거", "실사 질감", "Remove GPT", "우글거림 수정", "디테일 보강", "포커싱",
             "배경 제거"]
     MAIN_TABS = [0, 5, 6]                   # 메인 노출: 밴딩 제거 · 포커싱 · 배경 제거
-    LEGACY_TABS = [1, 2, 3, 4]              # 레거시 메뉴로 이동
-    TAB_W, TAB_H, PILL_PAD = 106, 40, 4
+    LEGACY_TABS = [1, 2, 3, 4]              # 사이드바 하단 흐린 그룹
 
-    LEG_W = 96                               # '레거시 ⋯' 필 폭
+    tk.Label(side, text="no photoshop", bg=COL["side"], fg=COL["text"],
+             font=(FONT, 13, "bold")).pack(anchor="w", padx=UIS(20), pady=(UIS(20), 0))
+    tk.Label(side, text="이미지 후처리", bg=COL["side"], fg=COL["dim"],
+             font=(FONT, 9)).pack(anchor="w", padx=UIS(20), pady=(UIS(1), UIS(16)))
 
-    def _pills():
-        """(x0, 폭, 종류, 값) — 메인 탭들 + 레거시 버튼"""
-        out = []
-        x = PILL_PAD
-        for i in MAIN_TABS:
-            out.append((x, TAB_W, "tab", i))
-            x += TAB_W
-        out.append((x, LEG_W, "legacy", None))
-        return out, x + LEG_W + PILL_PAD
+    nav_draws = []
 
-    def draw_tabs(_=None):
-        tabbar.delete("all")
-        pills, total_w = _pills()
-        rrect(tabbar, 0, 6, total_w, 6 + TAB_H + PILL_PAD * 2, 14,
-              fill=COL["card"], outline=COL["border"])
-        y0 = 6 + PILL_PAD
-        for x0, w, kind, i in pills:
-            if kind == "tab":
-                name = TABS[i]
-                active = (i == current["idx"])
-            else:
-                name = "레거시 ⋯"
-                active = (current["idx"] in LEGACY_TABS)
-                if active:
-                    name = TABS[current["idx"]]
+    def nav_item(idx, small=False):
+        h = UIS(30) if small else UIS(38)
+        cv = tk.Canvas(side, height=h, bg=COL["side"], highlightthickness=0,
+                       cursor="hand2")
+        cv.pack(fill="x", padx=UIS(10), pady=UIS(1))
+        st = {"hover": False}
+
+        def draw(_=None):
+            cv.delete("all")
+            w = cv.winfo_width() or UIS(186)
+            active = (current["idx"] == idx)
             if active:
-                rrect(tabbar, x0, y0, x0 + w, y0 + TAB_H, 11,
-                      fill=COL["lime"], outline="")
-                fg = "#101204"
+                rrect(cv, 0, 0, w, h, UIS(9), fill=COL["card2"], outline="")
+            elif st["hover"]:
+                rrect(cv, 0, 0, w, h, UIS(9), fill=COL["card"], outline="")
+            if active:
+                fg, fw = COL["text"], "bold"
+            elif st["hover"]:
+                fg, fw = COL["text"], "normal"
             else:
-                fg = COL["sub"] if kind == "tab" else COL["dim"]
-            tabbar.create_text(x0 + w / 2, y0 + TAB_H / 2, text=name,
-                               fill=fg, font=(FONT, 11, "bold"))
-        # 우측 끝 버전 표시
-        bw = tabbar.winfo_width() or 900
-        tabbar.create_text(bw - 6, 6 + PILL_PAD + TAB_H / 2, text=APP_VER,
-                           fill=COL["dim"], font=(MONO, 9), anchor="e")
-    tabbar.bind("<Configure>", draw_tabs)
+                fg, fw = (COL["dim"] if small else COL["sub"]), "normal"
+            cv.create_text(UIS(14), h / 2, text=TABS[idx], anchor="w", fill=fg,
+                           font=(FONT, 9 if small else 11, fw))
+        cv.bind("<Configure>", draw)
+        cv.bind("<Enter>", lambda e: (st.update(hover=True), draw()))
+        cv.bind("<Leave>", lambda e: (st.update(hover=False), draw()))
+        cv.bind("<Button-1>", lambda e: select_tab(idx))
+        nav_draws.append(draw)
+
+    for _i in MAIN_TABS:
+        nav_item(_i)
+
+    tk.Label(side, text="레 거 시", bg=COL["side"], fg=COL["dim"],
+             font=(FONT, 8, "bold")).pack(anchor="w", padx=UIS(24), pady=(UIS(20), UIS(3)))
+    for _i in LEGACY_TABS:
+        nav_item(_i, small=True)
+
+    tk.Label(side, text=APP_VER, bg=COL["side"], fg=COL["dim"],
+             font=(MONO, 9)).pack(side="bottom", anchor="w", padx=UIS(20), pady=UIS(16))
 
     def select_tab(idx):
         if idx != current["idx"]:
             current["idx"] = idx
-            draw_tabs()
             pages[idx].tkraise()
-
-    def on_tab_click(e):
-        pills, total_w = _pills()
-        for x0, w, kind, i in pills:
-            if x0 <= e.x <= x0 + w:
-                if kind == "tab":
-                    select_tab(i)
-                else:                        # 레거시 드롭다운
-                    menu = tk.Menu(root, tearoff=0, bg=COL["card"], fg=COL["text"],
-                                   activebackground=COL["lime"], activeforeground="#101204",
-                                   font=(FONT, 10))
-                    for li in LEGACY_TABS:
-                        menu.add_command(label=TABS[li],
-                                         command=lambda k=li: select_tab(k))
-                    menu.tk_popup(tabbar.winfo_rootx() + x0,
-                                  tabbar.winfo_rooty() + 6 + TAB_H + PILL_PAD * 2)
-                return
-
-    tabbar.bind("<Button-1>", on_tab_click)
-
-    body = tk.Frame(root, bg=COL["bg"])
-    body.pack(fill="both", expand=True)
+        for d in nav_draws:
+            d()
 
     def canvas_button(parent, text, width, height, primary=True):
+        width, height = UIS(width), UIS(height)
         cv = tk.Canvas(parent, width=width, height=height, bg=COL["bg"],
                        highlightthickness=0, cursor="hand2")
         state = {"hover": False, "enabled": True, "text": text}
@@ -1509,11 +1545,11 @@ def run_gui(initial_files):
                 fg = "#101204"
                 if not state["enabled"]:
                     fill, fg = COL["card2"], COL["dim"]
-                rrect(cv, 1, 1, width - 1, height - 1, 12, fill=fill, outline="")
+                rrect(cv, 1, 1, width - 1, height - 1, UIS(12), fill=fill, outline="")
             else:
                 fill = COL["card2"] if state["hover"] else COL["card"]
                 fg = COL["text"] if state["enabled"] else COL["dim"]
-                rrect(cv, 1, 1, width - 1, height - 1, 12, fill=fill,
+                rrect(cv, 1, 1, width - 1, height - 1, UIS(12), fill=fill,
                       outline=COL["border"])
             cv.create_text(width / 2, height / 2, text=state["text"], fill=fg,
                            font=(FONT, 11, "bold"))
@@ -1561,20 +1597,20 @@ def run_gui(initial_files):
         if media:
             mode_row = tk.Frame(page, bg=COL["bg"])
             mode_row.pack(fill="x", padx=24, pady=(10, 0))
-            mode_cv = tk.Canvas(mode_row, width=176, height=40, bg=COL["bg"],
+            mode_cv = tk.Canvas(mode_row, width=UIS(176), height=UIS(40), bg=COL["bg"],
                                 highlightthickness=0, cursor="hand2")
             mode_cv.pack(side="left")
-            MW, MH, MP = 82, 30, 4
+            MW, MH, MP = UIS(82), UIS(30), UIS(4)
 
             def draw_mode():
                 mode_cv.delete("all")
-                rrect(mode_cv, 0, 1, MW * 2 + MP * 2, 1 + MH + MP * 2, 11,
+                rrect(mode_cv, 0, 1, MW * 2 + MP * 2, 1 + MH + MP * 2, UIS(11),
                       fill=COL["card"], outline=COL["border"])
                 for i, name in enumerate(["IMG", "VIDEO"]):
                     x0 = MP + i * MW
                     active = (i == 1) == mode["video"]
                     if active:
-                        rrect(mode_cv, x0, 1 + MP, x0 + MW, 1 + MP + MH, 9,
+                        rrect(mode_cv, x0, 1 + MP, x0 + MW, 1 + MP + MH, UIS(9),
                               fill=COL["lime"], outline="")
                         fg = "#101204"
                     else:
@@ -1600,7 +1636,7 @@ def run_gui(initial_files):
         tk.Label(hint_row, text=" 로 저장돼요.", bg=COL["bg"], fg=COL["dim"],
                  font=(FONT, 10)).pack(side="left")
 
-        drop = tk.Canvas(page, bg=COL["bg"], highlightthickness=0, height=250)
+        drop = tk.Canvas(page, bg=COL["bg"], highlightthickness=0, height=UIS(250))
         drop.pack(fill="both", expand=True, padx=24, pady=(6, 0))
         pick_btn_box = {"bbox": (0, 0, 0, 0)}
 
@@ -2141,7 +2177,7 @@ def run_gui(initial_files):
 
         panel = tk.Frame(content, bg=COL["card"],
                          highlightbackground=COL["border"], highlightthickness=1,
-                         width=280)
+                         width=UIS(280))
         panel.pack(side="right", fill="y", padx=(14, 0))
         panel.pack_propagate(False)
         tk.Label(panel, text="효과 조절", bg=COL["card"], fg=COL["text"],
@@ -2612,7 +2648,7 @@ def run_gui(initial_files):
             row=1, column=1, sticky="ew", pady=(4, 0))
 
         # 드롭존
-        drop = tk.Canvas(page, bg=COL["bg"], highlightthickness=0, height=150)
+        drop = tk.Canvas(page, bg=COL["bg"], highlightthickness=0, height=UIS(150))
         drop.pack(fill="both", expand=True, padx=24, pady=(4, 0))
         pick_btn_box = {"bbox": (0, 0, 0, 0)}
 
@@ -2974,7 +3010,7 @@ def run_gui(initial_files):
         mini_slider(sgrid, "그레인", "grain", 100).grid(
             row=2, column=0, sticky="ew", padx=(0, 10), pady=(4, 0))
 
-        drop = tk.Canvas(page, bg=COL["bg"], highlightthickness=0, height=150)
+        drop = tk.Canvas(page, bg=COL["bg"], highlightthickness=0, height=UIS(150))
         drop.pack(fill="both", expand=True, padx=24, pady=(4, 0))
         pick_btn_box = {"bbox": (0, 0, 0, 0)}
 
@@ -3234,16 +3270,151 @@ def run_gui(initial_files):
                           fg=COL["dim"], font=(MONO, 10)); status.pack(side="left")
 
         main = tk.Frame(wrap, bg=COL["bg"]); main.pack(fill="both", expand=True, pady=10)
-        PVW = 640
+        PVW = 640                       # DoF 연산 해상도 (고정 — 인터랙션 속도 우선)
         prev_cv = tk.Canvas(main, width=PVW, height=int(PVW * 9 / 16), bg="#0a0b0c",
                             highlightthickness=1, highlightbackground=COL["border"])
-        prev_cv.pack(side="left")
+        prev_cv.pack(side="left", fill="both", expand=True)   # 표시 크기는 창 추종
         ctrl = tk.Frame(main, bg=COL["bg"]); ctrl.pack(side="left", fill="y", padx=(18, 0))
+
+        def _blit(bgr, fast=False):
+            """연산 해상도 프레임을 캔버스 크기에 맞춰 표시.
+            연산(고정 저해상)과 표시(창 추종)를 분리 — 리사이즈 시 재연산 없음.
+            fast=True(인터랙션 중)이며 표시가 크면 절반 해상도 + ×2 줌으로 그리고,
+            입력이 멎으면 220ms 뒤 고품질로 한 번 다시 그린다."""
+            cw = max(prev_cv.winfo_width(), 60)
+            ch2 = max(prev_cv.winfo_height(), 40)
+            sc = min((cw - 2) / bgr.shape[1], (ch2 - 2) / bgr.shape[0])
+            dw = max(2, int(bgr.shape[1] * sc)); dh = max(2, int(bgr.shape[0] * sc))
+            z = 1
+            if fast and dw > UIS(900):
+                z = 2
+                dw = max(2, dw // 2); dh = max(2, dh // 2)
+            disp = (bgr if (dw, dh) == (bgr.shape[1], bgr.shape[0]) else
+                    cv2.resize(bgr, (dw, dh),
+                               interpolation=(cv2.INTER_AREA if dw < bgr.shape[1]
+                                              else cv2.INTER_LINEAR)))
+            ok2, buf2 = cv2.imencode(".ppm", disp)
+            if not ok2:
+                return
+            ph2 = tk.PhotoImage(data=buf2.tobytes())
+            if z == 2:
+                ph2 = ph2.zoom(2)
+            S["photo"] = ph2
+            S["dw"], S["dh"] = dw * z, dh * z
+            S["ox"], S["oy"] = cw / 2 - S["dw"] / 2, ch2 / 2 - S["dh"] / 2
+            prev_cv.delete("all")
+            prev_cv.create_image(cw / 2, ch2 / 2, image=S["photo"])
+            if S["cnt"]:
+                prev_cv.create_text(cw / 2, ch2 / 2, text=str(S["cnt"]),
+                                    fill="#ff5252", font=(FONT, 64, "bold"), tags="cntdown")
+            if S.get("_hq"):
+                prev_cv.after_cancel(S["_hq"]); S["_hq"] = None
+            if fast and z == 2:                 # 인터랙션 멎으면 고품질 리프레시
+                S["_hq"] = prev_cv.after(
+                    220, lambda: (S.update(_hq=None),
+                                  _blit(S["view"]) if S["view"] is not None else None))
+
+        # ---- GDI 고속 표시 경로 — Tk 이미지 파이프라인(인코딩·파싱·복사)을 우회해
+        # numpy 프레임을 캔버스 HWND에 StretchDIBits로 직접 그린다. 전체화면에서도
+        # 회당 몇 ms라 작은 창과 같은 부드러움. 실패 시 기존 Tk 경로 폴백.
+        import ctypes as _ct
+
+        class _BIH(_ct.Structure):
+            _fields_ = [("biSize", _ct.c_uint32), ("biWidth", _ct.c_int32),
+                        ("biHeight", _ct.c_int32), ("biPlanes", _ct.c_uint16),
+                        ("biBitCount", _ct.c_uint16), ("biCompression", _ct.c_uint32),
+                        ("biSizeImage", _ct.c_uint32), ("biXPelsPerMeter", _ct.c_int32),
+                        ("biYPelsPerMeter", _ct.c_int32), ("biClrUsed", _ct.c_uint32),
+                        ("biClrImportant", _ct.c_uint32)]
+
+        _gdi = {"ok": os.name == "nt"}
+        if _gdi["ok"]:
+            try:
+                _u32 = _ct.windll.user32; _g32 = _ct.windll.gdi32
+                _u32.GetDC.restype = _ct.c_void_p
+                _u32.GetDC.argtypes = [_ct.c_void_p]
+                _u32.ReleaseDC.argtypes = [_ct.c_void_p, _ct.c_void_p]
+                _g32.SetStretchBltMode.argtypes = [_ct.c_void_p, _ct.c_int]
+                _g32.SetBrushOrgEx.argtypes = [_ct.c_void_p, _ct.c_int, _ct.c_int,
+                                               _ct.c_void_p]
+                _g32.StretchDIBits.argtypes = ([_ct.c_void_p] + [_ct.c_int] * 8 +
+                                               [_ct.c_void_p, _ct.c_void_p,
+                                                _ct.c_uint, _ct.c_uint32])
+            except Exception:
+                _gdi["ok"] = False
+
+        def _blit_gdi(bgr):
+            try:
+                hwnd = prev_cv.winfo_id()
+                cw = max(prev_cv.winfo_width(), 8)
+                ch2 = max(prev_cv.winfo_height(), 8)
+                h, w = bgr.shape[:2]
+                sc = min(cw / w, ch2 / h)
+                dw = max(2, int(w * sc)); dh = max(2, int(h * sc))
+                ox = (cw - dw) // 2; oy = (ch2 - dh) // 2
+                if (w * 3) % 4:                    # DIB 행은 4바이트 정렬 필요
+                    pad = 4 - (w * 3) % 4
+                    data = np.zeros((h, w * 3 + pad), np.uint8)
+                    data[:, :w * 3] = bgr.reshape(h, -1)
+                else:
+                    data = np.ascontiguousarray(bgr)
+                hdc = _u32.GetDC(hwnd)
+                if not hdc:
+                    return False
+                try:
+                    _g32.SetStretchBltMode(hdc, 4)             # HALFTONE
+                    _g32.SetBrushOrgEx(hdc, 0, 0, None)
+                    bi = _BIH(biSize=40, biWidth=w, biHeight=-h, biPlanes=1,
+                              biBitCount=24, biCompression=0)
+                    _g32.StretchDIBits(hdc, ox, oy, dw, dh, 0, 0, w, h,
+                                       data.ctypes.data_as(_ct.c_void_p),
+                                       _ct.byref(bi), 0, 0x00CC0020)   # SRCCOPY
+                finally:
+                    _u32.ReleaseDC(hwnd, hdc)
+                S["dw"], S["dh"] = dw, dh
+                S["ox"], S["oy"] = ox, oy
+                return True
+            except Exception:
+                return False
+
+        def _present(bgr):
+            """프레임 표시 진입점 — 카운트다운 합성 + GDI/Tk 경로 선택"""
+            if S["cnt"]:
+                bgr = bgr.copy()
+                txt = str(S["cnt"])
+                fs = max(1.5, bgr.shape[0] / 130.0)
+                th = max(4, int(fs * 3))
+                (tw2, th2), _ = cv2.getTextSize(txt, cv2.FONT_HERSHEY_SIMPLEX, fs, th)
+                org = ((bgr.shape[1] - tw2) // 2, (bgr.shape[0] + th2) // 2)
+                cv2.putText(bgr, txt, org, cv2.FONT_HERSHEY_SIMPLEX, fs,
+                            (20, 20, 20), th + 6, cv2.LINE_AA)
+                cv2.putText(bgr, txt, org, cv2.FONT_HERSHEY_SIMPLEX, fs,
+                            (82, 82, 255), th, cv2.LINE_AA)
+            if _gdi["ok"] and _blit_gdi(bgr):
+                return
+            _gdi["ok"] = False
+            _blit(bgr, fast=True)
+
+        def _on_pv_cfg(e):
+            if S["view"] is None:
+                return
+            if abs(e.width - S.get("_lw", 0)) + abs(e.height - S.get("_lh", 0)) > 8:
+                S["_lw"], S["_lh"] = e.width, e.height
+                _present(S["view"])
+        prev_cv.bind("<Configure>", _on_pv_cfg)
+
+        def _on_expose(_=None):                    # Tk가 배경을 다시 칠하면 재표시
+            if S["view"] is not None and not S.get("_exq"):
+                S["_exq"] = True
+                prev_cv.after_idle(lambda: (S.update(_exq=False),
+                                            _present(S["view"])
+                                            if S["view"] is not None else None))
+        prev_cv.bind("<Expose>", _on_expose)
 
         # ---- 포커스 휠 ----
         tk.Label(ctrl, text="FOCUS", bg=COL["bg"], fg=COL["sub"],
                  font=(FONT, 10, "bold")).pack(anchor="w")
-        WHEEL = 168
+        WHEEL = UIS(168)
         wheel = tk.Canvas(ctrl, width=WHEEL, height=WHEEL, bg=COL["bg"],
                           highlightthickness=0, cursor="hand2"); wheel.pack(pady=(4, 2))
         fval = tk.Label(ctrl, text="초점 —", bg=COL["bg"], fg=COL["lime"],
@@ -3338,7 +3509,7 @@ def run_gui(initial_files):
         tk.Label(ctrl, text="휠 감도", bg=COL["bg"], fg=COL["sub"],
                  font=(FONT, 10, "bold")).pack(anchor="w", pady=(8, 0))
         tk.Scale(ctrl, from_=1, to=20, resolution=0.5, orient="horizontal",
-                 variable=sens_var, showvalue=True, length=168, bg=COL["card"],
+                 variable=sens_var, showvalue=True, length=UIS(168), bg=COL["card"],
                  fg=COL["text"], troughcolor=COL["card2"], highlightthickness=0,
                  bd=0, font=(MONO, 8)).pack()
         tk.Label(ctrl, text="← 미세 조절          한 번에 휙 →", bg=COL["bg"],
@@ -3359,7 +3530,7 @@ def run_gui(initial_files):
         def on_ap(v):
             S["ap"] = float(v); request_render()
         ap_scale = tk.Scale(ctrl, from_=0, to=100, orient="horizontal", variable=ap_var,
-                            command=on_ap, showvalue=True, length=168, bg=COL["card"],
+                            command=on_ap, showvalue=True, length=UIS(168), bg=COL["card"],
                             fg=COL["text"], troughcolor=COL["card2"], highlightthickness=0,
                             bd=0, font=(MONO, 8)); ap_scale.pack()
         tk.Label(ctrl, text="← 깊은 심도        얕은 심도(보케) →", bg=COL["bg"],
@@ -3375,7 +3546,7 @@ def run_gui(initial_files):
             S["stk_key"] = None                # 작업공간 바뀜 → 슬라이스 캐시 무효화
             request_render()
         tk.Scale(ctrl, from_=0, to=100, orient="horizontal", variable=hl_var,
-                 command=on_hl, showvalue=True, length=168, bg=COL["card"],
+                 command=on_hl, showvalue=True, length=UIS(168), bg=COL["card"],
                  fg=COL["text"], troughcolor=COL["card2"], highlightthickness=0,
                  bd=0, font=(MONO, 8)).pack()
         tk.Label(ctrl, text="0 = 색 보존 · 광원 장면만 올리기", bg=COL["bg"],
@@ -3400,8 +3571,8 @@ def run_gui(initial_files):
             if not S["cnt"]:
                 return
             prev_cv.delete("cntdown")
-            prev_cv.create_text(PVW / 2, S["ph"] / 2, text=str(S["cnt"]),
-                                fill="#ff5252", font=(FONT, 64, "bold"), tags="cntdown")
+            if S["view"] is not None:              # 카운트다운 숫자는 프레임에 합성
+                _present(S["view"])
             rec_btn.set_text(f"●  {S['cnt']} ")
 
             def nxt():
@@ -3455,7 +3626,7 @@ def run_gui(initial_files):
                 S["fc"][S["cur"]] = S["focus"]; S["recmask"][S["cur"]] = True
             request_render()
         tl_scale = tk.Scale(tl, from_=0, to=0, orient="horizontal", variable=pos_var,
-                            command=on_scrub, showvalue=False, length=560, bg=COL["card"],
+                            command=on_scrub, showvalue=False, length=UIS(560), bg=COL["card"],
                             fg=COL["text"], troughcolor=COL["card2"], highlightthickness=0,
                             bd=0); tl_scale.pack(side="left", fill="x", expand=True, padx=8)
         frm_lbl = tk.Label(tl, text="0/0", bg=COL["bg"], fg=COL["dim"],
@@ -3667,7 +3838,7 @@ def run_gui(initial_files):
             S["lca"] = float(v) / 100.0
             request_render()
         tk.Scale(lrow, from_=0, to=100, orient="horizontal", variable=ca_var,
-                 command=on_ca, showvalue=True, length=130, bg=COL["card"],
+                 command=on_ca, showvalue=True, length=UIS(130), bg=COL["card"],
                  fg=COL["text"], troughcolor=COL["card2"], highlightthickness=0,
                  bd=0, font=(MONO, 8)).pack(side="left", padx=(4, 14))
         tk.Label(lrow, text="브리딩", bg=COL["bg"], fg=COL["sub"],
@@ -3678,7 +3849,7 @@ def run_gui(initial_files):
             S["lbr"] = float(v) / 100.0
             request_render()
         tk.Scale(lrow, from_=0, to=100, orient="horizontal", variable=br_var,
-                 command=on_br, showvalue=True, length=130, bg=COL["card"],
+                 command=on_br, showvalue=True, length=UIS(130), bg=COL["card"],
                  fg=COL["text"], troughcolor=COL["card2"], highlightthickness=0,
                  bd=0, font=(MONO, 8)).pack(side="left", padx=(4, 0))
         lrow.pack(fill="x", pady=(4, 0))
@@ -3889,17 +4060,9 @@ def run_gui(initial_files):
             bgr = np.clip(out * 255.0, 0, 255).astype(np.uint8)
             if lo:
                 bgr = cv2.resize(bgr, (S["pw"], S["ph"]), interpolation=cv2.INTER_LINEAR)
-            ok, buf = cv2.imencode(".ppm", bgr)
-            if not ok:
-                return
-            S["view"] = bgr                                  # 돋보기 소스
-            S["photo"] = tk.PhotoImage(data=buf.tobytes())   # PPM은 raw 바이트만 인식 (base64 불가)
-            prev_cv.delete("all")
-            prev_cv.create_image(PVW / 2, S["ph"] / 2, image=S["photo"])
+            S["view"] = bgr                                  # 돋보기 소스 (연산 해상도)
+            _present(bgr)
             frm_lbl.configure(text=f"{i+1}/{S['N']}")
-            if S["cnt"]:
-                prev_cv.create_text(PVW / 2, S["ph"] / 2, text=str(S["cnt"]),
-                                    fill="#ff5252", font=(FONT, 64, "bold"), tags="cntdown")
             draw_graph()
             update_mag()
 
@@ -3955,8 +4118,8 @@ def run_gui(initial_files):
             m.title(f"돋보기 ×{MAGX} — Tab으로 닫기")
             m.configure(bg="#0a0b0c")
             m.attributes("-topmost", True)     # 이동·크기조절은 OS 창 그대로
-            m.geometry(f"320x220+{root.winfo_pointerx() + 24}+{root.winfo_pointery() + 24}")
-            m.minsize(120, 90)
+            m.geometry(f"{UIS(320)}x{UIS(220)}+{root.winfo_pointerx() + 24}+{root.winfo_pointery() + 24}")
+            m.minsize(UIS(120), UIS(90))
             mcv = tk.Canvas(m, bg="#0a0b0c", highlightthickness=0)
             mcv.pack(fill="both", expand=True)
             S["mag"], S["magcv"] = m, mcv
@@ -3976,7 +4139,10 @@ def run_gui(initial_files):
         root.bind("<Tab>", toggle_mag)
 
         def on_move(e):
-            S["mx"], S["my"] = e.x, e.y
+            # 표시 좌표 → 연산 해상도 좌표 (돋보기 샘플링용)
+            dw = S.get("dw") or 1; dh = S.get("dh") or 1
+            S["mx"] = (e.x - S.get("ox", 0)) * (S["pw"] or 1) / dw
+            S["my"] = (e.y - S.get("oy", 0)) * (S["ph"] or 1) / dh
             if S["mag"] is not None:
                 update_mag()
         prev_cv.bind("<Motion>", on_move)
@@ -4053,7 +4219,7 @@ def run_gui(initial_files):
                     if not frames:
                         raise RuntimeError("프레임 없음")
                     H, W = frames[0].shape[:2]
-                    pw = PVW; ph = int(round(PVW * H / W))
+                    pw = PVW; ph = int(round(pw * H / W))   # 연산은 저해상 고정 — 표시만 창 추종
                     pv = [cv2.resize(f, (pw, ph)).astype(np.float32) / 255.0 for f in frames]
                     root.after(0, lambda: status.configure(text="깊이 인식 중 … (torch/GPU)"))
                     # subprocess 뎁스 추출
@@ -4109,7 +4275,6 @@ def run_gui(initial_files):
 
                     def done():
                         tl_scale.configure(to=N - 1); pos_var.set(0)
-                        prev_cv.configure(height=ph)
                         if load_proj():
                             status.configure(text=f"준비완료 · {N}프레임 · 저장된 포커스 프로젝트 복원됨", fg=COL["ok"])
                             draw_wheel(); draw_graph()
@@ -4213,10 +4378,20 @@ def run_gui(initial_files):
         status = tk.Label(top, text="영상을 드래그하거나 [영상 열기]", bg=COL["bg"],
                           fg=COL["dim"], font=(MONO, 10)); status.pack(side="left")
 
-        PV2 = 720
+        PV2 = UIS(720)
         prev = tk.Canvas(wrap, width=PV2, height=int(PV2 * 9 / 16), bg="#0a0b0c",
                          highlightthickness=1, highlightbackground=COL["border"])
-        prev.pack(pady=10)
+        prev.pack(pady=10, fill="x")            # 창 폭에 맞춰 늘어남
+
+        def _pvw():
+            """현재 미리보기 표시 폭 (창 크기 추종)"""
+            return max(UIS(300), (prev.winfo_width() or PV2) - 2)
+
+        def _on_prev_cfg(e):                    # 리사이즈 시 재렌더 (8px 이상 변할 때만)
+            if B["frames"] is not None and abs(e.width - B.get("_lw", 0)) > 8:
+                B["_lw"] = e.width
+                render_pv()
+        prev.bind("<Configure>", _on_prev_cfg)
 
         ctl = tk.Frame(wrap, bg=COL["bg"]); ctl.pack(fill="x")
         mode_btn = canvas_button(ctl, "배경: 투명(4444)", 150, 30, primary=False)
@@ -4232,7 +4407,7 @@ def run_gui(initial_files):
             i = B["cur"]
             img = B["frames"][i].astype(np.float32) / 255.0
             h, w = img.shape[:2]
-            pw = PV2; ph = int(round(pw * h / w))
+            pw = _pvw(); ph = int(round(pw * h / w))
             has_m = B["matte"] is not None and i < len(B["matte"])
             if has_m and B["view"] == "result":
                 a, rgb = _bgrm_alpha(i, img)
@@ -4261,7 +4436,7 @@ def run_gui(initial_files):
                 if mk is not None:                 # 마스크 외곽선 (AE 마스크처럼)
                     cs = cv2.findContours(mk, cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE)[0]
                     cv2.polylines(comp, cs, True, (20, 20, 20), 3, cv2.LINE_AA)
-                    cv2.polylines(comp, cs, True, (94, 242, 214), 1, cv2.LINE_AA)
+                    cv2.polylines(comp, cs, True, (255, 255, 255), 1, cv2.LINE_AA)
             ok2, buf = cv2.imencode(".ppm", comp)
             if not ok2:
                 return
@@ -4357,8 +4532,9 @@ def run_gui(initial_files):
             if B["frames"] is None or B["busy"]:
                 return
             h, w = B["frames"][0].shape[:2]
-            ph = int(round(PV2 * h / w))
-            x = int(round(ev.x * w / PV2))
+            pw = _pvw()
+            ph = int(round(pw * h / w))
+            x = int(round(ev.x * w / pw))
             y = int(round(ev.y * h / ph))
             if not (0 <= x < w and 0 <= y < h):
                 return
@@ -4381,7 +4557,7 @@ def run_gui(initial_files):
         tl2 = tk.Frame(wrap, bg=COL["bg"]); tl2.pack(fill="x", pady=(8, 0))
         sc2 = tk.Scale(tl2, from_=0, to=0, orient="horizontal", variable=pos2,
                        command=lambda v: (B.update(cur=int(float(v))), render_pv()),
-                       showvalue=False, length=560, bg=COL["card"], fg=COL["text"],
+                       showvalue=False, length=UIS(560), bg=COL["card"], fg=COL["text"],
                        troughcolor=COL["card2"], highlightthickness=0, bd=0)
         sc2.pack(side="left", fill="x", expand=True, padx=(0, 8))
         frm2 = tk.Label(tl2, text="0/0", bg=COL["bg"], fg=COL["dim"], font=(MONO, 9))
@@ -4652,34 +4828,24 @@ def run_gui(initial_files):
     pages[5] = build_focus_page()
     pages[6] = build_bgrm_page()
 
-    current["idx"] = 0
-    draw_tabs()
     pages[0].tkraise()
 
     if initial_files:
         if "--tab5" in sys.argv:   # UI 테스트용: 디테일 보강 탭으로 바로 로드
-            current["idx"] = 4
-            draw_tabs()
-            pages[4].tkraise()
+            select_tab(4)
             root.attributes("-topmost", True)
             root.after(200, pages[4].add_files, initial_files)
         elif "--tab4" in sys.argv:   # UI 테스트용: 우글거림 수정 탭으로 바로 로드
-            current["idx"] = 3
-            draw_tabs()
-            pages[3].tkraise()
+            select_tab(3)
             root.attributes("-topmost", True)
             root.after(200, pages[3].add_files, initial_files)
         elif "--tab2" in sys.argv:   # UI 테스트용: 실사 질감 탭으로 바로 로드
-            current["idx"] = 1
-            draw_tabs()
-            pages[1].tkraise()
+            select_tab(1)
             if "--autorun" in sys.argv:
                 root.attributes("-topmost", True)
             root.after(200, pages[1].add_files, initial_files)
         elif "--tab3" in sys.argv:   # UI 테스트용: Remove GPT 탭으로 바로 로드
-            current["idx"] = 2
-            draw_tabs()
-            pages[2].tkraise()
+            select_tab(2)
             root.after(200, pages[2].add_files, initial_files)
             if "--autorun" in sys.argv:
                 root.attributes("-topmost", True)
