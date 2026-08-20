@@ -25,7 +25,7 @@ import cv2
 EXTS = (".png", ".jpg", ".jpeg", ".webp", ".bmp", ".tif", ".tiff")
 VEXTS = (".mp4", ".mov", ".avi", ".mkv", ".webm")
 APP_TITLE = "no photoshop — 이미지 후처리"
-APP_VER = "ver 1.7"
+APP_VER = "ver 1.8"
 
 UPDATE_REPO = "necorlasu1000-code/no_photoshop"
 
@@ -4563,6 +4563,110 @@ def run_gui(initial_files):
         frm2 = tk.Label(tl2, text="0/0", bg=COL["bg"], fg=COL["dim"], font=(MONO, 9))
         frm2.pack(side="left")
 
+        # ---- 분석 로딩 오버레이 — 단계·퍼센트 카드 (프리뷰 위에 표시) ----
+        ov = tk.Frame(wrap, bg=COL["card"], highlightthickness=1,
+                      highlightbackground=COL["border"])
+        _ovh = tk.Frame(ov, bg=COL["card"])
+        _ovh.pack(fill="x", padx=UIS(18), pady=(UIS(14), UIS(8)))
+        tk.Label(_ovh, text="영상 분석 중", bg=COL["card"], fg=COL["text"],
+                 font=(FONT, 11, "bold")).pack(side="left")
+        ov_pct = tk.Label(_ovh, text="0%", bg=COL["card"], fg=COL["sub"],
+                          font=(MONO, 10))
+        ov_pct.pack(side="right", padx=(UIS(30), 0))
+        ov_bar = progress_bar(ov)
+        ov_bar.configure(bg=COL["card"], width=UIS(320))
+        ov_bar.pack(fill="x", padx=UIS(18))
+        ov_stage = tk.Label(ov, text="", bg=COL["card"], fg=COL["sub"],
+                            font=(FONT, 9), anchor="w", width=40)
+        ov_stage.pack(fill="x", padx=UIS(18), pady=(UIS(6), UIS(10)))
+        ov_cancel = canvas_button(ov, "취소", 90, 28, primary=False)
+        ov_cancel.configure(bg=COL["card"])
+        ov_cancel.pack(pady=(0, UIS(12)))
+
+        PRG = {"plan": [], "idx": 0, "frac": 0.0, "text": "", "dots": 0,
+               "animh": None, "job": 0, "cancel": False, "proc": None}
+
+        def _ov_render():
+            plan = PRG["plan"]
+            if not plan:
+                return
+            tw = sum(w for _, w in plan) or 1
+            done = (sum(w for _, w in plan[:PRG["idx"]])
+                    + plan[PRG["idx"]][1] * PRG["frac"])
+            f = min(1.0, done / tw)
+            ov_bar.set_frac(f)
+            ov_pct.configure(text=f"{int(round(f * 100))}%")
+            ov_stage.configure(text=PRG["text"] + " " + "·" * (1 + PRG["dots"]))
+
+        def _ov_set(key, frac, text):
+            keys = [k for k, _ in PRG["plan"]]
+            if key not in keys:
+                return
+            i = keys.index(key)
+            if i < PRG["idx"]:
+                return                          # 지난 단계로 회귀 금지 (지연/오류 라인)
+            if i > PRG["idx"]:
+                PRG["idx"] = i
+                PRG["frac"] = 0.0
+            if i == PRG["idx"] and frac is not None:
+                PRG["frac"] = max(PRG["frac"], min(1.0, frac))
+            PRG["text"] = text
+            _ov_render()
+
+        def ov_post(job, key, frac, text):
+            """작업 스레드에서 진행상황 반영 (GUI 스레드로 마샬링 · 세대 검사)"""
+            def _u():
+                if PRG["job"] == job:          # 이전 작업의 지연 갱신 무시
+                    _ov_set(key, frac, text)
+            root.after(0, _u)
+
+        def _ov_anim():
+            PRG["dots"] = (PRG["dots"] + 1) % 3
+            _ov_render()
+            PRG["animh"] = root.after(500, _ov_anim)
+
+        def _ov_show(plan, text):
+            """오버레이 표시 — 작업 세대 번호를 돌려준다 (지연 콜백 무효화용)"""
+            PRG["job"] += 1
+            PRG.update(plan=plan, idx=0, frac=0.0, text=text,
+                       dots=0, cancel=False, proc=None)
+            ov_cancel.set_text("취소")
+            ov.place(in_=prev, relx=0.5, rely=0.5, anchor="center")
+            ov.lift()
+            _ov_render()
+            if PRG["animh"] is not None:
+                try:
+                    root.after_cancel(PRG["animh"])
+                except Exception:
+                    pass
+            PRG["animh"] = root.after(500, _ov_anim)
+            return PRG["job"]
+
+        def _ov_hide(job=None):
+            if job is not None and job != PRG["job"]:
+                return                          # 이전 작업의 지연 콜백 — 무시
+            if PRG["animh"] is not None:
+                try:
+                    root.after_cancel(PRG["animh"])
+                except Exception:
+                    pass
+                PRG["animh"] = None
+            PRG["plan"] = []
+            ov.place_forget()
+
+        def _ov_cancel(_=None):
+            if PRG["cancel"] or not PRG["plan"]:
+                return
+            PRG["cancel"] = True
+            ov_cancel.set_text("취소 중 …")
+            p = PRG.get("proc")
+            if p is not None and p.poll() is None:
+                try:
+                    p.kill()
+                except Exception:
+                    pass
+        ov_cancel.bind("<Button-1>", _ov_cancel)
+
         def py2():
             if getattr(sys, "frozen", False):
                 return shutil.which("python") or shutil.which("py") or "python"
@@ -4640,7 +4744,7 @@ def run_gui(initial_files):
             SRV["thread"] = threading.Thread(target=work, daemon=True)
             SRV["thread"].start()
 
-        def _run_recog():
+        def _run_recog(job):
             """SAM2+매팅 인식 서브프로세스 실행 + 결과 로드 (작업 스레드에서 호출).
             B['pts']/B['neg']가 있으면 수동 포인트로, 없으면 자동 인식."""
             path = B["src"]
@@ -4652,29 +4756,79 @@ def run_gui(initial_files):
                 cmd += ["--neg", ";".join(f"{x},{y}" for x, y in B["neg"])]
             pr = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                                   text=True, creationflags=(0x08000000 if os.name == "nt" else 0))
+            PRG["proc"] = pr
+            if PRG["cancel"]:                  # 시작 직전에 취소 눌림 → 즉시 중단
+                try:
+                    pr.kill()
+                except Exception:
+                    pass
+            ov_post(job, "eread", None, "엔진 시작 (torch 로드)")
+
+            def _ij(l):
+                """'TAG i/n' → (i, n) — 총계 미상이면 n=0"""
+                try:
+                    a, b = l.split()[1].split("/")
+                    return int(a), int(b)
+                except Exception:
+                    return 0, 0
+            skipmsg = None
             for line in pr.stdout:
                 line = line.strip()
-                if line.startswith("MATTE"):
-                    root.after(0, lambda l=line: status.configure(text=f"매팅 {l.split()[1]}"))
-                elif line.startswith("SAM"):
-                    root.after(0, lambda: status.configure(text="피사체 분리(SAM2) …"))
-                elif line.startswith(("LOAD", "FRAMES")):
-                    root.after(0, lambda: status.configure(text="피사체 인식 …"))
+                if line.startswith("DEC "):
+                    i, n = _ij(line)
+                    ov_post(job, "eread", (i / n if n > 0 else None),
+                            f"엔진 · 소스 읽기 {i}" + (f"/{n}" if n > 0 else ""))
+                elif line.startswith("FRAMES"):
+                    ov_post(job, "eread", 1.0, "엔진 · 소스 읽기 완료")
+                elif line.startswith("LOAD"):
+                    ov_post(job, "eread", None, "피사체 인식 모델 로드")
+                elif line.startswith("PREP "):
+                    i, n = _ij(line)
+                    ov_post(job, "prep", (i / n * 0.7 if n else None),
+                            f"SAM2 준비 · 프레임 변환 {i}/{n}")
+                elif line.startswith("SAMLOAD"):
+                    ov_post(job, "prep", 0.75, "SAM2 모델 로드")
+                elif line.startswith("SAMINIT"):
+                    ov_post(job, "prep", 0.85, "SAM2 세션 초기화")
+                elif line.startswith("SAMP "):
+                    i, n = _ij(line)
+                    ov_post(job, "samp", (i / n if n else None), f"피사체 분리(SAM2) {i}/{n}")
+                elif line.startswith("MATTE "):
+                    i, n = _ij(line)
+                    ov_post(job, "matte", (i / n if n else None), f"경계 매팅(ViTMatte) {i}/{n}")
+                elif line.startswith("MLOAD"):
+                    ov_post(job, "matte", 0.0, "매팅 모델 로드")
+                elif line.startswith("SAVE"):
+                    ov_post(job, "save", None, "결과 저장 중")
+                elif line.startswith("SAMSKIP"):       # SAM2 실패 — 원인 보존
+                    skipmsg = (line.split(None, 1)[1] if " " in line else "SAM2 실패")[:120]
+                elif line.startswith("SAM"):           # SAM/SAMPT — 전파 준비 단계
+                    ov_post(job, "prep", None, "피사체 분리 준비")
             pr.wait()
+            if PRG["cancel"]:
+                try:
+                    os.remove(tmp)
+                except Exception:
+                    pass
+                raise RuntimeError("취소됨")
             if pr.returncode != 0 or not os.path.exists(tmp):
                 raise RuntimeError("인식 실패 (포커싱 탭에서 AI 구성요소를 먼저 설치하세요)")
+            ov_post(job, "save", 0.5, "결과 불러오는 중")
             z = np.load(tmp)
             if "salpha" not in z.files:
                 try:
                     os.remove(tmp)
                 except Exception:
                     pass
-                raise RuntimeError("피사체를 못 찾음 — 미리보기에서 피사체를 클릭 후 [다시 인식]")
+                raise RuntimeError("피사체를 못 찾음 — 미리보기에서 피사체를 클릭 후 [다시 인식]"
+                                   + (f" · 원인: {skipmsg}" if skipmsg else ""))
             matte = z["salpha"]; smask = z["smask"]; N = int(z["n"])
             try:
                 os.remove(tmp)
             except Exception:
                 pass
+            if PRG["cancel"]:                  # 결과 로드 중 취소 눌림
+                raise RuntimeError("취소됨")
             B.update({"matte": matte, "smask": smask, "N": N,
                       "cur": min(B["cur"], N - 1)})
 
@@ -4688,22 +4842,38 @@ def run_gui(initial_files):
                 render_pv()
             root.after(0, done)
 
+        def _fail_status(e):
+            """작업 실패/취소 → 상태 표시 (예외 메시지를 값으로 캡처)"""
+            msg = str(e)
+            root.after(0, lambda m=msg: status.configure(
+                text=("취소됨" if m == "취소됨" else f"실패: {m}"),
+                fg=(COL["sub"] if m == "취소됨" else COL["err"])))
+
         def load2(path):
             if B["busy"]:
                 return
             B["busy"] = True
             status.configure(text=f"불러오는 중: {os.path.basename(path)} …", fg=COL["sub"])
+            job = _ov_show([("read", 14), ("eread", 14), ("prep", 12),
+                            ("samp", 22), ("matte", 34), ("save", 4)], "영상 읽기")
 
             def work():
                 try:
                     cap = cv2.VideoCapture(path)
                     fps = cap.get(cv2.CAP_PROP_FPS) or 24.0
+                    total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
                     frames = []
                     while True:
                         ok2, f = cap.read()
                         if not ok2:
                             break
                         frames.append(f)
+                        if PRG["cancel"]:
+                            raise RuntimeError("취소됨")
+                        if len(frames) % 10 == 0:
+                            ov_post(job, "read", (len(frames) / total if total > 0 else None),
+                                    f"영상 읽기 {len(frames)}"
+                                    + (f"/{total}" if total > 0 else ""))
                     cap.release()
                     if not frames:
                         raise RuntimeError("프레임 없음")
@@ -4716,11 +4886,12 @@ def run_gui(initial_files):
                                            pos2.set(0),
                                            view_btn.set_text("원본 보기 (Tab)"),
                                            render_pv()))
-                    _run_recog()
+                    _run_recog(job)
                 except Exception as e:
-                    root.after(0, lambda: status.configure(text=f"실패: {e}", fg=COL["err"]))
+                    _fail_status(e)
                 finally:
                     B["busy"] = False
+                    root.after(0, lambda j=job: _ov_hide(j))
             threading.Thread(target=work, daemon=True).start()
 
         def rerun():
@@ -4728,14 +4899,17 @@ def run_gui(initial_files):
                 return
             B["busy"] = True
             status.configure(text="다시 인식 중 …", fg=COL["sub"])
+            job = _ov_show([("eread", 14), ("prep", 12), ("samp", 22),
+                            ("matte", 34), ("save", 4)], "엔진 시작")
 
             def work():
                 try:
-                    _run_recog()
+                    _run_recog(job)
                 except Exception as e:
-                    root.after(0, lambda: status.configure(text=f"실패: {e}", fg=COL["err"]))
+                    _fail_status(e)
                 finally:
                     B["busy"] = False
+                    root.after(0, lambda j=job: _ov_hide(j))
             threading.Thread(target=work, daemon=True).start()
 
         def do_render2():
@@ -4789,7 +4963,9 @@ def run_gui(initial_files):
                     root.after(0, lambda: status.configure(
                         text=f"완료: {os.path.basename(dst)}", fg=COL["ok"]))
                 except Exception as e:
-                    root.after(0, lambda: status.configure(text=f"렌더 실패: {e}", fg=COL["err"]))
+                    msg = str(e)
+                    root.after(0, lambda m=msg: status.configure(
+                        text=f"렌더 실패: {m}", fg=COL["err"]))
                 finally:
                     B["busy"] = False
             threading.Thread(target=work, daemon=True).start()

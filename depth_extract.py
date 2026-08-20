@@ -135,10 +135,16 @@ def sam2_subject_mattes(frames, d0, dev, pts=None, neg=None):
     pts = [list(p) for p in pts]
     neg = [list(p) for p in (neg or [])]
     H, W = frames[0].shape[:2]
-    rgb = [cv2.cvtColor(f, cv2.COLOR_BGR2RGB) for f in frames]
+    rgb = []
+    for k, f in enumerate(frames):
+        rgb.append(cv2.cvtColor(f, cv2.COLOR_BGR2RGB))
+        if (k + 1) % 24 == 0:
+            print(f"PREP {k + 1}/{len(frames)}", flush=True)
     MID = "facebook/sam2.1-hiera-small"
+    print("SAMLOAD", flush=True)
     sproc = _hf(Sam2VideoProcessor.from_pretrained, MID)
     smodel = _hf(Sam2VideoModel.from_pretrained, MID, dtype=torch.bfloat16).to(dev).eval()
+    print("SAMINIT", flush=True)
     sess = sproc.init_video_session(video=rgb, inference_device=dev, dtype=torch.bfloat16)
 
     def _prompt():
@@ -180,10 +186,13 @@ def sam2_subject_mattes(frames, d0, dev, pts=None, neg=None):
     for o in smodel.propagate_in_video_iterator(sess):
         mk = sproc.post_process_masks([o.pred_masks], original_sizes=[[H, W]])[0]
         masks[o.frame_idx] = (mk[0, 0] > 0).cpu().numpy().astype(np.uint8)
+        if len(masks) % 4 == 0 or len(masks) == len(frames):
+            print(f"SAMP {len(masks)}/{len(frames)}", flush=True)
     del smodel, sess
     torch.cuda.empty_cache()
 
     VID = "hustvl/vitmatte-small-composition-1k"
+    print("MLOAD", flush=True)
     vproc = _hf(VitMatteImageProcessor.from_pretrained, VID)
     vmodel = _hf(VitMatteForImageMatting.from_pretrained, VID).to(dev).eval()
     kb = np.ones((25, 25), np.uint8)
@@ -306,13 +315,17 @@ def main():
     W = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     H = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
     fps = cap.get(cv2.CAP_PROP_FPS) or 24.0
+    total = max(0, int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0))
     frames, grays = [], []
     while True:
         ok, f = cap.read()
         if not ok:
             break
         frames.append(f)
-        grays.append(cv2.cvtColor(f, cv2.COLOR_BGR2GRAY))
+        if not matteonly:              # 배경 제거 경로는 grays 미사용 — RAM 절약
+            grays.append(cv2.cvtColor(f, cv2.COLOR_BGR2GRAY))
+        if len(frames) % 12 == 0:
+            print(f"DEC {len(frames)}/{total}", flush=True)
     cap.release()
     N = len(frames)
     if N == 0:
@@ -354,6 +367,7 @@ def main():
                     smask[i] = sm[i][2]
                     salpha[i] = (sm[i][0] * 255.0 + 0.5).astype(np.uint8)
             extra = {"smask": smask, "salpha": salpha}
+        print("SAVE", flush=True)
         np.savez_compressed(out, fps=np.float32(fps), n=np.int32(N),
                             h=np.int32(H), w=np.int32(W), **extra)
         print(f"DONE {out}", flush=True)
