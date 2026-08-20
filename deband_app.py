@@ -1474,8 +1474,8 @@ def run_gui(initial_files):
     pages = {}
     current = {"idx": 0}
     TABS = ["밴딩 제거", "실사 질감", "Remove GPT", "우글거림 수정", "디테일 보강", "포커싱",
-            "배경 제거"]
-    MAIN_TABS = [0, 5, 6]                   # 메인 노출: 밴딩 제거 · 포커싱 · 배경 제거
+            "배경 제거", "가상 카메라 β"]
+    MAIN_TABS = [0, 5, 6, 7]                # 메인 노출 + TEST: 가상 카메라
     LEGACY_TABS = [1, 2, 3, 4]              # 사이드바 하단 흐린 그룹
 
     tk.Label(side, text="no photoshop", bg=COL["side"], fg=COL["text"],
@@ -4816,6 +4816,444 @@ def run_gui(initial_files):
         page.add_files = lambda files: (files and load2(files[0]))
         return page
 
+    def build_vcam_page():
+        """TEST · 가상 카메라 — 완성 클립에 뎁스 기반 카메라 무빙(펀치인/리프레임) 추가."""
+        page = tk.Frame(body, bg=COL["bg"])
+        page.place(x=0, y=0, relwidth=1, relheight=1)
+        V = {"pv": None, "pvd": None, "frames": None, "depth16": None,
+             "pva": None, "bgp": None, "salpha": None, "smask": None,
+             "N": 0, "fps": 24.0, "W": 0, "H": 0, "cur": 0, "busy": False,
+             "src": None, "playing": False, "view": None, "photo": None,
+             "edit": "A", "par": 0.7, "grid": None,
+             "A": {"z": 1.0, "cx": 0.5, "cy": 0.5},
+             "B": {"z": 1.35, "cx": 0.5, "cy": 0.5},
+             "dw": 1, "dh": 1, "ox": 0, "oy": 0}
+
+        wrap = tk.Frame(page, bg=COL["bg"])
+        wrap.pack(fill="both", expand=True, padx=22, pady=14)
+        tk.Label(wrap, justify="left", bg=COL["bg"], fg=COL["sub"], font=(FONT, 10),
+                 text="TEST · 완성된 클립에 뎁스 기반 카메라 무빙을 더합니다 — 와이드 하나로 푸시인·클로즈업 커버리지 파생.\n"
+                      "미리보기 드래그=프레이밍 · 휠=줌 · [A 시작]/[B 끝] 카메라를 잡으면 클립 전체에 A→B 무빙. "
+                      "이동시차 0%는 단순 펀치인, 올릴수록 돌리(달리)처럼 가까운 것이 더 크게 움직입니다."
+                 ).pack(anchor="w", pady=(0, 8))
+        top = tk.Frame(wrap, bg=COL["bg"]); top.pack(fill="x")
+        status = tk.Label(top, text="영상을 드래그하거나 [영상 열기]", bg=COL["bg"],
+                          fg=COL["dim"], font=(MONO, 10)); status.pack(side="left")
+        open_b = canvas_button(top, "영상 열기", 90, 30, primary=True)
+        open_b.pack(side="right")
+        pbar3 = progress_bar(wrap)
+        pbar3.pack(fill="x", pady=(6, 0))
+
+        def _setp(f):
+            root.after(0, lambda: pbar3.set_frac(f))
+
+        prev = tk.Canvas(wrap, height=UIS(420), bg="#0a0b0c", cursor="fleur",
+                         highlightthickness=1, highlightbackground=COL["border"])
+        prev.pack(fill="both", expand=True, pady=10)
+
+        # ---- GDI 고속 표시 (포커싱 탭과 동일 기법, 페이지 로컬) ----
+        import ctypes as _c2
+
+        class _BIH2(_c2.Structure):
+            _fields_ = [("biSize", _c2.c_uint32), ("biWidth", _c2.c_int32),
+                        ("biHeight", _c2.c_int32), ("biPlanes", _c2.c_uint16),
+                        ("biBitCount", _c2.c_uint16), ("biCompression", _c2.c_uint32),
+                        ("biSizeImage", _c2.c_uint32), ("biXPelsPerMeter", _c2.c_int32),
+                        ("biYPelsPerMeter", _c2.c_int32), ("biClrUsed", _c2.c_uint32),
+                        ("biClrImportant", _c2.c_uint32)]
+
+        _g2 = {"ok": os.name == "nt"}
+        if _g2["ok"]:
+            try:
+                _u2 = _c2.windll.user32; _gd2 = _c2.windll.gdi32
+                _u2.GetDC.restype = _c2.c_void_p
+                _u2.GetDC.argtypes = [_c2.c_void_p]
+                _u2.ReleaseDC.argtypes = [_c2.c_void_p, _c2.c_void_p]
+                _gd2.SetStretchBltMode.argtypes = [_c2.c_void_p, _c2.c_int]
+                _gd2.SetBrushOrgEx.argtypes = [_c2.c_void_p, _c2.c_int, _c2.c_int,
+                                               _c2.c_void_p]
+                _gd2.StretchDIBits.argtypes = ([_c2.c_void_p] + [_c2.c_int] * 8 +
+                                               [_c2.c_void_p, _c2.c_void_p,
+                                                _c2.c_uint, _c2.c_uint32])
+            except Exception:
+                _g2["ok"] = False
+
+        def _present2(bgr):
+            cw = max(prev.winfo_width(), 8); chh = max(prev.winfo_height(), 8)
+            h, w = bgr.shape[:2]
+            sc = min(cw / w, chh / h)
+            dw = max(2, int(w * sc)); dh = max(2, int(h * sc))
+            V["dw"], V["dh"] = dw, dh
+            V["ox"], V["oy"] = (cw - dw) // 2, (chh - dh) // 2
+            if _g2["ok"]:
+                try:
+                    data = np.ascontiguousarray(bgr)
+                    hdc = _u2.GetDC(prev.winfo_id())
+                    if hdc:
+                        try:
+                            _gd2.SetStretchBltMode(hdc, 4)
+                            _gd2.SetBrushOrgEx(hdc, 0, 0, None)
+                            bi = _BIH2(biSize=40, biWidth=w, biHeight=-h, biPlanes=1,
+                                       biBitCount=24, biCompression=0)
+                            _gd2.StretchDIBits(hdc, V["ox"], V["oy"], dw, dh, 0, 0, w, h,
+                                               data.ctypes.data_as(_c2.c_void_p),
+                                               _c2.byref(bi), 0, 0x00CC0020)
+                            return
+                        finally:
+                            _u2.ReleaseDC(prev.winfo_id(), hdc)
+                except Exception:
+                    _g2["ok"] = False
+            disp = cv2.resize(bgr, (dw, dh))
+            ok2, buf = cv2.imencode(".ppm", disp)
+            if ok2:
+                V["photo"] = tk.PhotoImage(data=buf.tobytes())
+                prev.delete("all")
+                prev.create_image(cw / 2, chh / 2, image=V["photo"])
+
+        prev.bind("<Expose>", lambda e: V["view"] is not None and _present2(V["view"]))
+        prev.bind("<Configure>", lambda e: V["view"] is not None and _present2(V["view"]))
+
+        # ---- 카메라/워프 ----
+        def _grid(w, h):
+            if V["grid"] is None or V["grid"][0].shape != (h, w):
+                V["grid"] = np.meshgrid(np.arange(w, dtype=np.float32),
+                                        np.arange(h, dtype=np.float32))
+            return V["grid"]
+
+        def cam_at(t):
+            e = t * t * (3.0 - 2.0 * t)            # smoothstep 이징
+            A, B = V["A"], V["B"]
+            return {k: A[k] + (B[k] - A[k]) * e for k in ("z", "cx", "cy")}
+
+        def smooth_dn(dn):
+            """워프용 뎁스 정리 — 근경 팽창(max) + 블러.
+            깊이 절벽이 있으면 backward warp에서 실루엣 단층(찢어짐)이 생기므로,
+            피사체를 최근경으로 한 덩어리로 굳히고 경사를 완만하게 만든다."""
+            w2 = dn.shape[1]
+            k = max(3, int(w2 * 0.030) * 2 + 1)
+            d = cv2.dilate(dn, np.ones((k, k), np.uint8))
+            d = cv2.GaussianBlur(d, (0, 0), w2 * 0.035)
+            # 대비 압축(뎁스 요철 물결 억제) — 기준점은 고정 0.5.
+            # 프레임별 평균을 쓰면 평균 변동이 확대율을 흔들어 깜빡임이 생긴다.
+            return 0.5 + (d - 0.5) * 0.7
+
+        def warp(img, dn, cam, par):
+            """뎁스 가중 줌 리프레임 — (cx,cy)의 소스 지점이 화면 중앙에 오도록.
+            par>0이면 가까운 픽셀이 더 크게 확대되어 돌리 이동시차가 생긴다."""
+            h, w = img.shape[:2]
+            gx, gy = _grid(w, h)
+            z = max(1.0, float(cam["z"]))
+            zc = _zcov(cam, w, h)
+            zeff = np.maximum(1.0 + (z - 1.0) * (1.0 - par + par * dn), zc)
+            mapx = cam["cx"] * w + (gx - w * 0.5) / zeff
+            mapy = cam["cy"] * h + (gy - h * 0.5) / zeff
+            return cv2.remap(img, mapx, mapy, cv2.INTER_LINEAR,
+                             borderMode=cv2.BORDER_REPLICATE)
+
+        def _zcov(cam, w, h):
+            """패닝 시 샘플 창이 원본 밖으로 나가지 않는 최소 줌(커버리지 하한).
+            밖을 보면 가장자리 픽셀이 늘어나 물결 줄무늬가 생긴다."""
+            cxp, cyp = cam["cx"] * w, cam["cy"] * h
+            mx = max(min(cxp, w - cxp), 1e-3)
+            my = max(min(cyp, h - cyp), 1e-3)
+            return max(1.0, w / (2.0 * mx), h / (2.0 * my))
+
+        def render_pv():
+            if V["pv"] is None:
+                return
+            i = V["cur"]
+            t = i / max(1, V["N"] - 1)
+            out = warp(V["pv"][i], V["pvd"][i], cam_at(t), V["par"])
+            V["view"] = out
+            _present2(out)
+            st = V[V["edit"]]
+            frm_l.configure(text=f"{i+1}/{V['N']} · 편집 {V['edit']} · z {st['z']:.2f}")
+
+        # ---- 컨트롤 ----
+        ctl = tk.Frame(wrap, bg=COL["bg"]); ctl.pack(fill="x")
+        ab_b = canvas_button(ctl, "편집: A (시작)", 120, 30, primary=False)
+        ab_b.pack(side="left", padx=(0, 6))
+        cpy_b = canvas_button(ctl, "B ← A 복사", 100, 30, primary=False)
+        cpy_b.pack(side="left", padx=(0, 6))
+        rst_b = canvas_button(ctl, "초기화", 70, 30, primary=False)
+        rst_b.pack(side="left", padx=(0, 14))
+        tk.Label(ctl, text="이동시차", bg=COL["bg"], fg=COL["sub"],
+                 font=(FONT, 9)).pack(side="left")
+        par_v = tk.IntVar(value=70)
+        tk.Scale(ctl, from_=0, to=100, orient="horizontal", variable=par_v,
+                 command=lambda v: (V.update(par=int(v) / 100.0), render_pv()),
+                 showvalue=True, length=UIS(150), bg=COL["card"], fg=COL["text"],
+                 troughcolor=COL["card2"], highlightthickness=0, bd=0,
+                 font=(MONO, 8)).pack(side="left", padx=(6, 0))
+        rend_b = canvas_button(ctl, "렌더", 90, 30, primary=True)
+        rend_b.pack(side="right")
+
+        tl = tk.Frame(wrap, bg=COL["bg"]); tl.pack(fill="x", pady=(8, 0))
+        play_b = canvas_button(tl, "▶", 40, 30, primary=False); play_b.pack(side="left")
+        pos_v = tk.IntVar(value=0)
+        sc3 = tk.Scale(tl, from_=0, to=0, orient="horizontal", variable=pos_v,
+                       command=lambda v: (V.update(cur=int(float(v)), playing=False),
+                                          render_pv()),
+                       showvalue=False, bg=COL["card"], fg=COL["text"],
+                       troughcolor=COL["card2"], highlightthickness=0, bd=0)
+        sc3.pack(side="left", fill="x", expand=True, padx=8)
+        frm_l = tk.Label(tl, text="0/0", bg=COL["bg"], fg=COL["dim"], font=(MONO, 9))
+        frm_l.pack(side="left")
+
+        def set_edit(which):
+            V["edit"] = which
+            ab_b.set_text("편집: A (시작)" if which == "A" else "편집: B (끝)")
+            V["cur"] = 0 if which == "A" else max(0, V["N"] - 1)
+            pos_v.set(V["cur"])
+            render_pv()
+        ab_b.bind("<Button-1>", lambda e: set_edit("B" if V["edit"] == "A" else "A"))
+
+        def copy_ab(_=None):
+            V["B"] = dict(V["A"])
+            set_edit("B")
+        cpy_b.bind("<Button-1>", lambda e: copy_ab())
+
+        def reset_cam(_=None):
+            V["A"] = {"z": 1.0, "cx": 0.5, "cy": 0.5}
+            V["B"] = {"z": 1.35, "cx": 0.5, "cy": 0.5}
+            set_edit("A")
+        rst_b.bind("<Button-1>", lambda e: reset_cam())
+
+        drag = {"x": 0, "y": 0}
+
+        def on_press(e):
+            drag["x"], drag["y"] = e.x, e.y
+
+        def on_drag(e):
+            if V["pv"] is None:
+                return
+            st = V[V["edit"]]
+            z = max(st["z"], 1.0)
+            st["cx"] = min(0.83, max(0.17, st["cx"] - (e.x - drag["x"]) / (V["dw"] * z)))
+            st["cy"] = min(0.83, max(0.17, st["cy"] - (e.y - drag["y"]) / (V["dh"] * z)))
+            drag["x"], drag["y"] = e.x, e.y
+            render_pv()
+
+        def on_wheel(e):
+            if V["pv"] is None:
+                return
+            st = V[V["edit"]]
+            st["z"] = min(3.0, max(1.0, st["z"] * (1.08 if e.delta > 0 else 1 / 1.08)))
+            render_pv()
+        prev.bind("<Button-1>", on_press)
+        prev.bind("<B1-Motion>", on_drag)
+        prev.bind("<MouseWheel>", on_wheel)
+
+        def toggle_play(_=None):
+            if V["pv"] is None:
+                return
+            V["playing"] = not V["playing"]
+            play_b.set_text("❚❚" if V["playing"] else "▶")
+            if V["playing"]:
+                _tick()
+        play_b.bind("<Button-1>", toggle_play)
+
+        def _tick():
+            if not V["playing"] or V["pv"] is None:
+                return
+            V["cur"] = (V["cur"] + 1) % V["N"]
+            pos_v.set(V["cur"])
+            render_pv()
+            root.after(max(15, int(1000 / max(V["fps"], 1.0))), _tick)
+
+        # ---- 로드 (뎁스 파이프라인 재사용) ----
+        def py3():
+            if getattr(sys, "frozen", False):
+                return shutil.which("python") or shutil.which("py") or "python"
+            return sys.executable
+
+        def scr3():
+            d = (os.path.dirname(os.path.abspath(sys.argv[0])) if getattr(sys, "frozen", False)
+                 else os.path.dirname(os.path.abspath(__file__)))
+            return os.path.join(d, "depth_extract.py")
+
+        def load3(path):
+            if V["busy"]:
+                return
+            V["busy"] = True
+            V["playing"] = False
+            pbar3.set_frac(0.0)
+            status.configure(text=f"불러오는 중: {os.path.basename(path)} …", fg=COL["sub"])
+
+            def work():
+                try:
+                    cap = cv2.VideoCapture(path)
+                    fps = cap.get(cv2.CAP_PROP_FPS) or 24.0
+                    frames = []
+                    while True:
+                        ok3, f = cap.read()
+                        if not ok3:
+                            break
+                        frames.append(f)
+                    cap.release()
+                    if not frames:
+                        raise RuntimeError("프레임 없음")
+                    H, W = frames[0].shape[:2]
+                    tmp = os.path.join(os.path.dirname(os.path.abspath(path)),
+                                       "._vcam_depth.npz")
+                    pr = subprocess.Popen([py3(), scr3(), path, tmp],
+                                          stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                          text=True,
+                                          creationflags=(0x08000000 if os.name == "nt" else 0))
+                    for line in pr.stdout:
+                        line = line.strip()
+                        if line.startswith("PROG"):
+                            root.after(0, lambda l=line: status.configure(
+                                text=f"깊이 인식 {l.split()[1]}"))
+                            try:
+                                a3, b3 = line.split()[1].split("/")
+                                _setp(0.55 * int(a3) / max(1, int(b3)))
+                            except Exception:
+                                pass
+                        elif line.startswith(("STAB", "SNAP")):
+                            root.after(0, lambda: status.configure(text="깊이 안정화 …"))
+                            _setp(0.58)
+                        elif line.startswith("MATTE"):
+                            root.after(0, lambda l=line: status.configure(
+                                text=f"피사체 매팅 {l.split()[1]}"))
+                            try:
+                                a3, b3 = line.split()[1].split("/")
+                                _setp(0.62 + 0.28 * int(a3) / max(1, int(b3)))
+                            except Exception:
+                                pass
+                        elif line.startswith("SAM"):
+                            root.after(0, lambda: status.configure(text="피사체 분리(SAM2) …"))
+                            _setp(0.60)
+                    pr.wait()
+                    if pr.returncode != 0 or not os.path.exists(tmp):
+                        raise RuntimeError("뎁스 추출 실패 (포커싱 탭에서 AI 구성요소 먼저 설치)")
+                    z = np.load(tmp)
+                    depth16 = z["depth"]; N = int(z["n"])
+                    salpha = z["salpha"] if "salpha" in z.files else None
+                    smask = z["smask"] if "smask" in z.files else None
+                    try:
+                        os.remove(tmp)
+                    except Exception:
+                        pass
+                    pw = 640; ph = int(round(pw * H / W))
+                    pv = [cv2.resize(f, (pw, ph), interpolation=cv2.INTER_AREA)
+                          for f in frames]
+                    rd = [cv2.resize(depth16[k].astype(np.float32) / 65535.0, (pw, ph),
+                                     interpolation=cv2.INTER_LINEAR) for k in range(N)]
+                    if smask is not None:
+                        # 피사체 뎁스 평탄화 — 클립 전체에서 하나의 상수 깊이로 고정.
+                        # 피사체는 강체로 확대(내부 늘어남 없음)되고, 합성·인페인트가
+                        # 없으므로 깜빡임 원인 자체가 없다.
+                        root.after(0, lambda: status.configure(text="뎁스 정리(피사체 평탄화) …"))
+                        rm = [cv2.resize(smask[k], (pw, ph),
+                                         interpolation=cv2.INTER_NEAREST) for k in range(N)]
+                        cs = []
+                        for k in range(0, N, max(1, N // 12)):
+                            m = rm[k] > 0
+                            if m.any():
+                                cs.append(float(np.percentile(rd[k][m], 85)))
+                        c_subj = float(np.median(cs)) if cs else None
+                        ks = max(3, int(9 * pw / W) | 1)
+                        k9s = np.ones((ks, ks), np.uint8)
+                        pvd = []
+                        for k in range(N):
+                            if k % 8 == 0:
+                                _setp(0.90 + 0.08 * k / max(1, N))
+                            d2 = rd[k]
+                            if c_subj is not None:
+                                mm = cv2.dilate(rm[k], k9s)
+                                d2 = np.where(mm > 0, c_subj, d2).astype(np.float32)
+                            pvd.append(smooth_dn(d2))
+                    else:
+                        pvd = [smooth_dn(rd[k]) for k in range(N)]
+                    if N >= 3:                     # 시간축 3탭 블렌딩 (미세 요동 제거)
+                        pvd = ([pvd[0]] +
+                               [0.25 * pvd[k - 1] + 0.5 * pvd[k] + 0.25 * pvd[k + 1]
+                                for k in range(1, N - 1)] + [pvd[-1]])
+                    V.update({"frames": frames, "pv": pv, "pvd": pvd, "depth16": depth16,
+                              "pva": None, "bgp": None, "salpha": None, "smask": None,
+                              "N": N, "fps": fps, "W": W, "H": H, "src": path, "cur": 0})
+
+                    def done():
+                        sc3.configure(to=N - 1)
+                        pbar3.set_frac(1.0)
+                        status.configure(text=f"준비완료 · {N}프레임 · A/B 카메라 잡고 재생으로 확인",
+                                         fg=COL["ok"])
+                        reset_cam()
+                    root.after(0, done)
+                except Exception as e:
+                    root.after(0, lambda: status.configure(text=f"실패: {e}", fg=COL["err"]))
+                finally:
+                    V["busy"] = False
+            threading.Thread(target=work, daemon=True).start()
+
+        # ---- 렌더 (원본 해상도) ----
+        def do_render3():
+            if V["frames"] is None or V["busy"]:
+                return
+            V["busy"] = True
+            V["playing"] = False
+            status.configure(text="렌더 중 …", fg=COL["sub"])
+            par = V["par"]
+
+            def work():
+                try:
+                    ff = get_ffmpeg()
+                    W, H, N = V["W"], V["H"], V["N"]
+                    base3, _ = os.path.splitext(V["src"])
+                    dst = base3 + "_vcam.mov"
+                    cmd = [ff, "-y", "-f", "rawvideo", "-pix_fmt", "bgr24",
+                           "-s", f"{W}x{H}", "-r", f"{V['fps']}", "-i", "-",
+                           "-i", V["src"], "-map", "0:v", "-map", "1:a?", "-c:a", "copy",
+                           "-c:v", "prores_ks", "-profile:v", "3",
+                           "-pix_fmt", "yuv422p10le", dst]
+                    p3 = subprocess.Popen(cmd, stdin=subprocess.PIPE,
+                                          stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                                          creationflags=(0x08000000 if os.name == "nt" else 0))
+                    for i in range(N):
+                        t = i / max(1, N - 1)
+                        db = cv2.resize(V["pvd"][i], (W, H),
+                                        interpolation=cv2.INTER_LINEAR)
+                        out = warp(V["frames"][i], db, cam_at(t), par)
+                        p3.stdin.write(out.tobytes())
+                        if i % 5 == 0:
+                            _setp((i + 1) / N)
+                            root.after(0, lambda v=int((i + 1) / N * 100):
+                                       status.configure(text=f"렌더 중 … {v}%"))
+                    p3.stdin.close(); p3.wait()
+                    if p3.returncode != 0:
+                        raise RuntimeError("FFmpeg 인코딩 실패")
+                    root.after(0, lambda: status.configure(
+                        text=f"완료: {os.path.basename(dst)}", fg=COL["ok"]))
+                except Exception as e:
+                    root.after(0, lambda: status.configure(text=f"렌더 실패: {e}", fg=COL["err"]))
+                finally:
+                    V["busy"] = False
+            threading.Thread(target=work, daemon=True).start()
+        rend_b.bind("<Button-1>", lambda e: do_render3())
+
+        def open_dlg3(_=None):
+            p = filedialog.askopenfilename(filetypes=[("영상", "*.mp4 *.mov *.avi *.mkv *.webm")])
+            if p:
+                load3(p)
+        open_b.bind("<Button-1>", open_dlg3)
+        if dnd_ok:
+            def on_drop3(ev):
+                try:
+                    paths = root.tk.splitlist(ev.data)
+                except Exception:
+                    paths = [ev.data]
+                if paths:
+                    load3(paths[0].strip("{}"))
+            for wdg in (page, prev):
+                try:
+                    wdg.drop_target_register(DND_FILES)
+                    wdg.dnd_bind("<<Drop>>", on_drop3)
+                except Exception:
+                    pass
+        page.add_files = lambda files: (files and load3(files[0]))
+        return page
+
     pages[0] = build_page(
         "밴딩(계단현상) 제거 — 이미지는 디테일 보존 스무딩, 영상은 여러 프레임을 "
         "스태킹해 진짜 10비트 계조를 복원(색보정 버팀). 영상은 ProRes .mov(그레이딩용)+"
@@ -4827,6 +5265,7 @@ def run_gui(initial_files):
     pages[4] = build_detailboost_page()
     pages[5] = build_focus_page()
     pages[6] = build_bgrm_page()
+    pages[7] = build_vcam_page()
 
     pages[0].tkraise()
 
