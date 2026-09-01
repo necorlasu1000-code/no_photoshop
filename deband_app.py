@@ -249,14 +249,20 @@ def deband_video(src, progress=None):
 
 
 # ---------------- 처리 1c: 영상 스태킹 디밴딩 (진짜 10비트 복원) ----------------
-def _deband_core_float(f):
+def _deband_core_float(f, gate_src=None):
     """엣지 게이트 다중스케일 스무딩 (float, 그레인/양자화 없음).
-    스태킹이 못 채운 빠른 모션 영역의 잔여 밴딩 보강용."""
+    gate_src: 평탄/디테일 판정에 쓸 이미지. None이면 f 자신(구버전 동작).
+    스태킹으로 이미 뭉개진 이미지를 스스로 보고 판정하면 '여긴 평탄하다'고
+    오판해 더 뭉개는 자기강화 루프가 된다. 디테일이 살아있는 원본 프레임을
+    넘겨주면 연기·머리카락 같은 저대비 구조를 제대로 보호한다."""
     scales = [(6, 1.2, 4.0), (16, 1.5, 5.0), (40, 2.0, 6.0), (100, 2.5, 7.0)]
+    g = f if gate_src is None else gate_src
     for sigma, t_low, t_high in scales:
         blur = cv2.GaussianBlur(f, (0, 0), sigmaX=sigma, sigmaY=sigma,
                                 borderType=cv2.BORDER_REPLICATE)
-        diff = np.abs(f - blur).max(axis=2)
+        gblur = cv2.GaussianBlur(g, (0, 0), sigmaX=sigma, sigmaY=sigma,
+                                 borderType=cv2.BORDER_REPLICATE)
+        diff = np.abs(g - gblur).max(axis=2)
         k = max(3, int(sigma // 3) | 1)
         diff = cv2.dilate(diff, np.ones((k, k), np.uint8))
         diff = cv2.GaussianBlur(diff, (0, 0), sigmaX=max(2, sigma / 4))
@@ -264,6 +270,43 @@ def _deband_core_float(f):
         wgt = (t * t * (3 - 2 * t))[..., None]           # smoothstep 게이트
         f = f * (1 - wgt) + blur * wgt
     return f
+
+
+# ---- PQ(SMPTE ST 2084) 변환 — 지각 균일 공간에서 그레인을 넣기 위함 ----
+_PQ_M1, _PQ_M2 = 2610 / 16384, 2523 / 4096 * 128
+_PQ_C1, _PQ_C2, _PQ_C3 = 3424 / 4096, 2413 / 4096 * 32, 2392 / 4096 * 32
+_SDR_WHITE = 203.0                    # BT.2408 기준 SDR 백색 휘도(nit)
+
+
+def _to_pq(v):
+    """BT.709 감마 0~255 → PQ 10bit 코드"""
+    lin = np.power(np.clip(v, 0, 255) / 255.0, 2.4) * _SDR_WHITE
+    y = np.clip(lin / 10000.0, 0, 1)
+    yp = np.power(y, _PQ_M1)
+    return np.power((_PQ_C1 + _PQ_C2 * yp) / (1.0 + _PQ_C3 * yp), _PQ_M2) * 1023.0
+
+
+def _from_pq(p):
+    e = np.power(np.clip(p, 0, 1023) / 1023.0, 1.0 / _PQ_M2)
+    yp = np.maximum(e - _PQ_C1, 0) / (_PQ_C2 - _PQ_C3 * e)
+    y = np.power(np.clip(yp, 0, None), 1.0 / _PQ_M1) * 10000.0
+    return np.clip(np.power(np.clip(y / _SDR_WHITE, 0, None), 1 / 2.4) * 255.0, 0, 255)
+
+
+def _add_grain_pq(img, amp, seed):
+    """지각 균일 그레인. 레벨 고정 그레인은 암부에서 과하고 밝은 곳에서 약하다
+    (코드 8에서 1레벨 = 6.3 PQ코드 ≈ 6 JND). PQ 공간에서 넣으면 밝기와 무관하게
+    일정한 지각 강도가 되고, 잔여 계단을 가려 HDR에서도 밴딩이 안 보이게 한다.
+    또한 이 그레인이 있어야 8비트 경로(프리미어 8bit·스크린샷·유튜브)를 지날 때
+    다시 뭉치지 않는다."""
+    h, w = img.shape[:2]
+    P = _to_pq(img)
+    dm = cv2.GaussianBlur(np.abs(P - cv2.GaussianBlur(P, (0, 0), 12)).max(axis=2),
+                          (0, 0), 6)
+    flat = np.clip((20.0 - dm) / 20.0, 0.0, 1.0)[..., None]   # 평탄부에 강하게
+    rng = np.random.default_rng(seed)
+    noise = rng.normal(0.0, 1.0, size=(h, w, 1)).astype(np.float32)
+    return _from_pq(P + noise * (amp * flat))
 
 
 def stack_deband_video(src, progress=None, radius=12):
@@ -318,7 +361,10 @@ def stack_deband_video(src, progress=None, radius=12):
     proc = _enc(dst, "prores")
     proc_prev = _enc(prev, "hevc")
 
-    SIGMA, DETAIL_SIGMA, DETAIL_W, DITHER = 6.0, 1.6, 0.6, 0.08
+    # DETAIL_W=0.6 은 고주파의 40%를 스태킹 결과에서 가져와 디테일을 깎았고,
+    # DITHER=0.08 은 10bit LSB의 0.32배로 정상 TPDF(0.25)에 미달이었다.
+    SIGMA, DETAIL_SIGMA, DETAIL_W, DITHER = 6.0, 10.0, 1.0, 0.25
+    GRAIN_PQ = 1.6                    # 그레인 진폭 (PQ 코드 ≈ JND)
     gx, gy = np.meshgrid(np.arange(W, dtype=np.float32),
                          np.arange(H, dtype=np.float32))
     tls = threading.local()
@@ -348,12 +394,14 @@ def stack_deband_video(src, progress=None, radius=12):
             acc += warped.astype(np.float32) * w
             wsum += w
         stacked = acc / wsum
-        # 고주파(텍스처)는 원본에서 복원 — 밴딩은 저주파에만 삼
+        # 저주파(계조)만 스태킹에서, 고주파(텍스처)는 원본에서 100% 복원.
+        # 밴딩은 저주파에만 살고, 스태킹 고주파는 정렬 실패 시 뭉개진 평균이다.
         low_s = cv2.GaussianBlur(stacked, (0, 0), DETAIL_SIGMA)
         low_c = cv2.GaussianBlur(cf, (0, 0), DETAIL_SIGMA)
-        out = low_s + (cf - low_c) * DETAIL_W + (stacked - low_s) * (1.0 - DETAIL_W)
-        out = _deband_core_float(out)                      # 잔여 밴딩 보강
-        rng = np.random.default_rng(777 + i)
+        out = low_s + (cf - low_c) * DETAIL_W
+        out = _deband_core_float(out, gate_src=cf)         # 게이트는 원본 프레임에서
+        out = _add_grain_pq(out, GRAIN_PQ, 777 + i)        # 지각 균일 그레인
+        rng = np.random.default_rng(1777 + i)
         d = (rng.random((H, W, 1), dtype=np.float32) -
              rng.random((H, W, 1), dtype=np.float32)) * DITHER   # TPDF 디더
         out = out + d
