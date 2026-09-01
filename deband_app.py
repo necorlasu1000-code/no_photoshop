@@ -25,7 +25,7 @@ import cv2
 EXTS = (".png", ".jpg", ".jpeg", ".webp", ".bmp", ".tif", ".tiff")
 VEXTS = (".mp4", ".mov", ".avi", ".mkv", ".webm")
 APP_TITLE = "no photoshop — 이미지 후처리"
-APP_VER = "ver 1.8.1"
+APP_VER = "ver 1.8.2"
 
 UPDATE_REPO = "necorlasu1000-code/no_photoshop"
 
@@ -36,6 +36,33 @@ def _ver_tuple(v):
     return tuple(n + [0] * (3 - len(n)))
 
 
+def _spawn_apply(tmp, updir, appdir):
+    """앱 종료를 기다렸다가 파일을 교체하는 배치를 백그라운드로 띄운다."""
+    bat = os.path.join(tmp, "nophotoshop_apply.bat")
+    # 배치는 바이너리로 쓴다 — 텍스트 모드로 열면 \r\n 이 \r\r\n 으로 변환된다.
+    # 인코딩은 mbcs(=시스템 ANSI). cmd 가 배치를 읽는 코드페이지와 맞춰야
+    # 한글이 든 경로가 깨지지 않는다(예전의 chcp 65001 우회보다 확실하다).
+    # 대기는 timeout 이 아니라 ping 으로 한다 — timeout 은 콘솔 stdin 이 없으면
+    # "Input redirection is not supported" 로 즉시 실패해서 대기 루프가
+    # 코어 하나를 100% 로 태운다.
+    script = (
+        '@echo off\r\n'
+        ':wait\r\n'
+        'tasklist /FI "IMAGENAME eq No photoshop.exe" | '
+        'find /I "No photoshop.exe" >nul\r\n'
+        'if not errorlevel 1 (ping -n 3 127.0.0.1 >nul & goto wait)\r\n'
+        f'xcopy /E /Y /Q "{updir}\*" "{appdir}\\" >nul\r\n'
+        f'rmdir /S /Q "{updir}"\r\n'
+        'del "%~f0"\r\n')
+    with open(bat, "wb") as f:
+        f.write(script.encode("mbcs", "replace"))
+    # CREATE_NO_WINDOW 단독으로 띄운다. DETACHED_PROCESS(0x8) 와 같이 주면
+    # 조합이 무효라 콘솔 창이 뜨고, 사용자가 그 창을 닫으면 교체가 중단된다.
+    subprocess.Popen(["cmd", "/c", bat],
+                     creationflags=0x08000000,   # CREATE_NO_WINDOW
+                     close_fds=True)
+
+
 def check_update_async(root):
     """사일런트 자동 업데이트 (EXE 실행일 때만): 시작 시 백그라운드로 최신
     GitHub 릴리스를 확인하고 zip을 받아두면, 교체 스크립트가 앱 종료를 기다렸다가
@@ -43,9 +70,16 @@ def check_update_async(root):
     if not getattr(sys, "frozen", False):
         return
 
+    def mark(tag):
+        try:
+            root.after(0, lambda: root.title(
+                f"{APP_TITLE}   ({tag} 준비됨 — 껐다 켜면 적용)"))
+        except Exception:
+            pass
+
     def work():
         try:
-            import json, urllib.request, tempfile, zipfile, re
+            import json, urllib.request, tempfile, zipfile
             req = urllib.request.Request(
                 f"https://api.github.com/repos/{UPDATE_REPO}/releases/latest",
                 headers={"User-Agent": "no-photoshop-updater"})
@@ -60,32 +94,31 @@ def check_update_async(root):
                 return
             appdir = os.path.dirname(os.path.abspath(sys.argv[0]))
             tmp = tempfile.gettempdir()
+            updir = os.path.join(tmp, "nophotoshop_update")
+            stamp = os.path.join(tmp, "nophotoshop_update.version")
+            # 같은 버전을 이미 받아뒀으면 다시 받지 않는다 — 예전에는 실행할
+            # 때마다 87MB 를 재다운로드하고 배치를 또 띄웠다.
+            try:
+                if (os.path.isfile(os.path.join(updir, "No photoshop.exe"))
+                        and os.path.isfile(stamp)
+                        and open(stamp, encoding="utf-8").read().strip() == tag):
+                    _spawn_apply(tmp, updir, appdir)
+                    mark(tag)
+                    return
+            except Exception:
+                pass
             zpath = os.path.join(tmp, "nophotoshop_update.zip")
             urllib.request.urlretrieve(asset["browser_download_url"], zpath)
-            updir = os.path.join(tmp, "nophotoshop_update")
             shutil.rmtree(updir, ignore_errors=True)
             with zipfile.ZipFile(zpath) as z:
                 z.extractall(updir)
             os.remove(zpath)
             if not os.path.exists(os.path.join(updir, "No photoshop.exe")):
                 return                       # zip 구조 검증 실패 → 적용 안함
-            bat = os.path.join(tmp, "nophotoshop_apply.bat")
-            with open(bat, "w", encoding="utf-8") as f:
-                f.write('@echo off\r\nchcp 65001 >nul\r\n'
-                        ':wait\r\n'
-                        'tasklist /FI "IMAGENAME eq No photoshop.exe" | find /I "No photoshop.exe" >nul\r\n'
-                        'if not errorlevel 1 (timeout /t 2 /nobreak >nul & goto wait)\r\n'
-                        f'xcopy /E /Y /Q "{updir}\\*" "{appdir}\\" >nul\r\n'
-                        f'rmdir /S /Q "{updir}"\r\n'
-                        'del "%~f0"\r\n')
-            subprocess.Popen(["cmd", "/c", bat],
-                             creationflags=0x08000008,   # DETACHED | NO_WINDOW
-                             close_fds=True)
-            try:
-                root.after(0, lambda: root.title(
-                    f"{APP_TITLE}   ({tag} 준비됨 — 껐다 켜면 적용)"))
-            except Exception:
-                pass
+            with open(stamp, "w", encoding="utf-8") as f:
+                f.write(tag)
+            _spawn_apply(tmp, updir, appdir)
+            mark(tag)
         except Exception:
             pass
     threading.Thread(target=work, daemon=True).start()
