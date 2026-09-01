@@ -25,9 +25,12 @@ import cv2
 EXTS = (".png", ".jpg", ".jpeg", ".webp", ".bmp", ".tif", ".tiff")
 VEXTS = (".mp4", ".mov", ".avi", ".mkv", ".webm")
 APP_TITLE = "no photoshop — 이미지 후처리"
-APP_VER = "ver 1.8.3"
+APP_VER = "ver 1.8.4"
 
 UPDATE_REPO = "necorlasu1000-code/no_photoshop"
+
+# 노이즈의 크로마(채널차) 성분 배율. 0 이면 채널 공통(=루마만 디더).
+CHROMA_NOISE = 0.5
 
 
 def _ver_tuple(v):
@@ -326,15 +329,30 @@ def _from_pq(p):
     return np.clip(np.power(np.clip(y / _SDR_WHITE, 0, None), 1 / 2.4) * 255.0, 0, 255)
 
 
-def _blue_noise(h, w, seed):
+def _blue_noise(h, w, seed, chroma=0.0):
     """블루노이즈: 백색에서 저주파를 빼 고주파로 몰아넣은 뒤 std 1 로 정규화.
     눈은 고주파 대비에 둔감해서, 같은 진폭이라도 백색보다 덜 거칠게 보인다.
     실측(720p/1080p): 마스킹은 오히려 좋아지고(평탄 암부 런 2.73→2.23)
-    체감 노이즈는 19% 감소."""
-    rng = np.random.default_rng(seed)
-    n = rng.normal(0.0, 1.0, size=(h, w, 1)).astype(np.float32)
-    n = n - cv2.GaussianBlur(n, (0, 0), 1.6)[..., None]
-    return n / (float(n.std()) + 1e-9)
+    체감 노이즈는 19% 감소.
+
+    chroma>0 이면 채널차(크로마) 성분을 그 배율로 더한다. 채널 공통 노이즈만
+    쓰면 Y 만 흔들려 U/V 가 전혀 디더되지 않아 색 계조가 뭉친다(U 런 9→37).
+    3채널 노이즈를 그냥 쓰면 루마 세기가 1.00→0.60 으로 떨어지므로,
+    루마 성분과 크로마 성분을 분리해 더해 루마 진폭을 보존한다."""
+    def _bn(sd, ch):
+        rng = np.random.default_rng(sd)
+        n = rng.normal(0.0, 1.0, size=(h, w, ch)).astype(np.float32)
+        b = cv2.GaussianBlur(n, (0, 0), 1.6)
+        if b.ndim == 2:
+            b = b[..., None]
+        n = n - b
+        return n / (float(n.std()) + 1e-9)
+    lum = _bn(seed, 1)
+    if chroma <= 0:
+        return lum
+    c = _bn(seed + 555, 3)
+    c = c - c.mean(axis=2, keepdims=True)      # 순수 크로마(채널차) 성분
+    return lum + c * chroma
 
 
 def _add_grain_pq(img, amp, seed):
@@ -348,7 +366,7 @@ def _add_grain_pq(img, amp, seed):
     dm = cv2.GaussianBlur(np.abs(P - cv2.GaussianBlur(P, (0, 0), 12)).max(axis=2),
                           (0, 0), 6)
     flat = np.clip((20.0 - dm) / 20.0, 0.0, 1.0)[..., None]   # 평탄부에 강하게
-    return _from_pq(P + _blue_noise(h, w, seed) * (amp * flat))
+    return _from_pq(P + _blue_noise(h, w, seed, CHROMA_NOISE) * (amp * flat))
 
 
 def stack_deband_video(src, progress=None, radius=12):
@@ -394,6 +412,12 @@ def stack_deband_video(src, progress=None, radius=12):
                "-f", "rawvideo", "-pix_fmt", "bgr48le", "-s", f"{W}x{H}",
                "-r", f"{fps}", "-i", "-",
                "-i", src, "-map", "0:v", "-map", "1:a?", "-c:a", "copy",
+               # -colorspace 등 출력 인자만으로는 prores_ks/MOV 에 colr 아톰이
+               # 기록되지 않는다(실측: 아톰 자체가 없음). 프레임에 직접 심는
+               # setparams 필터라야 nclc 1/1/1(BT.709) 이 박힌다. 태그가 없으면
+               # 편집 프로그램마다 색을 다르게 추측한다.
+               "-vf", "setparams=color_primaries=bt709:color_trc=bt709:"
+                      "colorspace=bt709:range=tv",
                *vargs,
                "-color_primaries", "bt709", "-color_trc", "bt709",
                "-colorspace", "bt709", out]
@@ -445,7 +469,7 @@ def stack_deband_video(src, progress=None, radius=12):
         out = _add_grain_pq(out, GRAIN_PQ, 777 + i)        # 지각 균일 그레인
         # 디더도 블루노이즈. DITHER 는 이제 TPDF 파라미터가 아니라 std 다.
         # TPDF 로 같은 세기를 내면 체감이 나빠지지만(0.266→0.310) 블루는 유지된다.
-        out = out + _blue_noise(H, W, 1777 + i) * DITHER
+        out = out + _blue_noise(H, W, 1777 + i, CHROMA_NOISE) * DITHER
         return i, np.clip(out * 257.0 + 0.5, 0, 65535).astype(np.uint16)
 
     from multiprocessing.pool import ThreadPool
