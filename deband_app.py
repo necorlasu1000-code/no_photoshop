@@ -25,7 +25,7 @@ import cv2
 EXTS = (".png", ".jpg", ".jpeg", ".webp", ".bmp", ".tif", ".tiff")
 VEXTS = (".mp4", ".mov", ".avi", ".mkv", ".webm")
 APP_TITLE = "no photoshop — 이미지 후처리"
-APP_VER = "ver 1.8"
+APP_VER = "ver 1.8.1"
 
 UPDATE_REPO = "necorlasu1000-code/no_photoshop"
 
