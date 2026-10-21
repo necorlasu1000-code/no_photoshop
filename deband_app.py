@@ -25,7 +25,7 @@ import cv2
 EXTS = (".png", ".jpg", ".jpeg", ".webp", ".bmp", ".tif", ".tiff")
 VEXTS = (".mp4", ".mov", ".avi", ".mkv", ".webm")
 APP_TITLE = "no photoshop — 이미지 후처리"
-APP_VER = "ver 1.8.5"
+APP_VER = "ver 1.8.6"
 
 UPDATE_REPO = "necorlasu1000-code/no_photoshop"
 
@@ -171,29 +171,62 @@ def imwrite_u(path, img):
 
 
 # ---------------- 처리 1: 디밴딩 ----------------
+def _mem_avail_bytes():
+    """가용 물리 RAM 바이트 (Windows, 외부 의존성 없음). 워커 수 자동 조절용."""
+    import ctypes
+    class MS(ctypes.Structure):
+        _fields_ = ([("dwLength", ctypes.c_ulong), ("dwMemoryLoad", ctypes.c_ulong)] +
+                    [(n, ctypes.c_ulonglong) for n in
+                     ("ullTotalPhys", "ullAvailPhys", "ullTotalPageFile", "ullAvailPageFile",
+                      "ullTotalVirtual", "ullAvailVirtual", "ullAvailExtendedVirtual")])
+    m = MS(); m.dwLength = ctypes.sizeof(MS)
+    if not ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(m)):
+        raise OSError(ctypes.GetLastError())
+    return int(m.ullAvailPhys)
+
+
 def _guided_blur(f, sigma, eps):
     """엣지 보존 블러(가우시안 가이디드 필터). 루마를 가이드로 써서 밝기가 크게
     다른 픽셀은 평균에 섞지 않는다.
 
-    왜 필요한가: 가우시안 블러는 인물 옆 배경을 계산할 때 인물까지 끌어와 배경과
+    왜 필요한가(1.8.5): 가우시안 블러는 인물 옆 배경을 계산할 때 인물까지 끌어와 배경과
     다른 값이 된다. 게이트는 윤곽 바로 옆만 '엣지'로 보호하고 조금 떨어진 곳은
     '평탄'으로 판정해 그 오염된 블러를 그대로 내보내므로, 윤곽을 따라 1~2코드의
     띠(헤일로)가 생긴다. 4개 스케일이 각각 다른 거리에 띠를 만들어 동심원이 된다.
-    흰 배경·어두운 인물에서 가장 심하고(실측 최대 2.3코드), 어두운 배경에서는
-    스포트라이트 그라데이션에 묻혀 안 보였을 뿐 똑같이 있었다.
-    실측(v1.8.5): 띠 -1.52/-2.28 → -0.02/-0.14 코드(98% 제거), CAMBI·디테일 동일,
-    출력이 원본에 더 가까워짐(0.938→0.779). 비용은 코어 연산 2.7배.
+    실측: 띠 -1.52/-2.28 → -0.02/-0.14 코드(98% 제거), CAMBI·디테일 동일.
+
+    1.8.6 — 메모리·속도. 1.8.5 첫 구현은 중간 배열 10여 개를 동시에 들고 있어
+    7200×2400 에서 워커당 2.32GB(1.8.4 가우시안 1.35GB) → 16워커가 64GB 를 넘겨
+    스왑, 10초 클립에 2.5시간. 지금은 (1) 중간 배열을 하나씩 쓰고 바로 버리고
+    (2) 큰 σ 는 축소해서 계산한다(Fast Guided Filter: a·b 계수를 저해상도에서
+    구해 확대 — He&Sun 2015). 결과는 같은 7200×2400 프레임에서 최대 0.003코드 차.
+    실측(7200×2400 1프레임): 178s/2.32GB → 43s/0.79GB. 1.8.4 보다도 빠르고 가볍다.
+    축소 배율: σ20 마다 2배, 최대 4배, 단 축소 후 짧은 변이 540px 이상이도록
+    (1080p 는 σ100 도 2배까지만 — 4배는 최대 0.3코드 차가 나서).
     eps = GUIDED_EDGE**2. 밴딩 계단(1코드)은 분산이 작아 그대로 평활되고,
     인물 윤곽(수십 코드)은 분산이 커서 보존된다."""
     _g = lambda x, s: cv2.GaussianBlur(x, (0, 0), sigmaX=s, sigmaY=s,
                                        borderType=cv2.BORDER_REPLICATE)
-    g = f.mean(axis=2)
-    mg = _g(g, sigma); mf = _g(f, sigma)
-    vg = _g(g * g, sigma) - mg * mg
-    cov = _g(g[..., None] * f, sigma) - mg[..., None] * mf
-    a = cov / (vg[..., None] + eps)
-    b = mf - a * mg[..., None]
-    return _g(a, sigma) * g[..., None] + _g(b, sigma)
+    H, W = f.shape[:2]
+    ds = max(1, min(4, int(sigma // 20), min(H, W) // 540))
+    gf = f.mean(axis=2)                                   # 가이드(루마), 풀해상도
+    if ds > 1:
+        fs = cv2.resize(f, (W // ds, H // ds), interpolation=cv2.INTER_AREA)
+        gs = cv2.resize(gf, (W // ds, H // ds), interpolation=cv2.INTER_AREA)
+        s = sigma / ds
+    else:
+        fs, gs, s = f, gf, sigma
+    mg = _g(gs, s); mf = _g(fs, s)
+    vg = _g(gs * gs, s); vg -= mg * mg                    # 가이드 분산
+    a = _g(gs[..., None] * fs, s); a -= mg[..., None] * mf  # 공분산
+    a /= (vg[..., None] + eps); del vg                    # a 계수
+    b = mf; b -= a * mg[..., None]; del mg                # b 계수 (mf 를 제자리에서 재사용)
+    a = _g(a, s); b = _g(b, s)
+    if ds > 1:
+        a = cv2.resize(a, (W, H), interpolation=cv2.INTER_LINEAR)
+        b = cv2.resize(b, (W, H), interpolation=cv2.INTER_LINEAR)
+    a *= gf[..., None]; a += b                            # out = a·guide + b (제자리)
+    return a
 
 
 def _deband_core(img, seed=12345, progress=None):
@@ -319,18 +352,21 @@ def _deband_core_float(f, gate_src=None):
     오판해 더 뭉개는 자기강화 루프가 된다. 디테일이 살아있는 원본 프레임을
     넘겨주면 연기·머리카락 같은 저대비 구조를 제대로 보호한다."""
     scales = [(6, 1.2, 4.0), (16, 1.5, 5.0), (40, 2.0, 6.0), (100, 2.5, 7.0)]
-    g = f if gate_src is None else gate_src
+    g = f.copy() if gate_src is None else gate_src   # 아래는 제자리 연산이라 자기참조 게이트는 복사
     for sigma, t_low, t_high in scales:
         blur = _guided_blur(f, sigma, GUIDED_EDGE ** 2)   # 헤일로 방지 (설명은 _guided_blur)
         gblur = cv2.GaussianBlur(g, (0, 0), sigmaX=sigma, sigmaY=sigma,
                                  borderType=cv2.BORDER_REPLICATE)
-        diff = np.abs(g - gblur).max(axis=2)
+        diff = np.abs(g - gblur).max(axis=2); del gblur
         k = max(3, int(sigma // 3) | 1)
         diff = cv2.dilate(diff, np.ones((k, k), np.uint8))
         diff = cv2.GaussianBlur(diff, (0, 0), sigmaX=max(2, sigma / 4))
-        t = np.clip((t_high - diff) / (t_high - t_low), 0.0, 1.0)
-        wgt = (t * t * (3 - 2 * t))[..., None]           # smoothstep 게이트
-        f = f * (1 - wgt) + blur * wgt
+        t = np.clip((t_high - diff) / (t_high - t_low), 0.0, 1.0); del diff
+        t *= t * (3 - 2 * t)                              # smoothstep 게이트 (제자리)
+        # f = f*(1-w) + blur*w 를 임시 배열 없이: 7200×2400 에선 배열 하나가 207MB 라
+        # 이 한 줄의 임시 배열들만으로도 워커당 수백 MB 가 왔다갔다 했다.
+        blur -= f; blur *= t[..., None]; f += blur
+        del blur, t
     return f
 
 
@@ -500,6 +536,19 @@ def stack_deband_video(src, progress=None, radius=12):
 
     from multiprocessing.pool import ThreadPool
     workers = min(16, max(2, (os.cpu_count() or 4) - 2))
+    # 메모리 기반 워커 자동 조절(1.8.6). 실측 7200×2400: 워커당 피크 3.57GB = 프레임
+    # float32 의 18.5배(스태킹 임시배열이 대부분, 디밴딩 코어는 0.79GB). 16워커면 75GB 로
+    # 64GB 를 넘겨 스왑 → 1.8.5 에서 10초 클립에 2.5시간(1.8.4 도 84GB 로 스왑 중이었음).
+    # 1080p 는 워커당 0.46GB 라 16 그대로. 프레임 적재가 끝난 뒤의 가용 RAM 으로 계산.
+    # 워커 수는 '몇 장을 동시에' 하느냐만 정하므로 결과 픽셀은 바뀌지 않는다.
+    try:
+        avail = _mem_avail_bytes()
+        per_worker = int(18.5 * H * W * 3 * 4)
+        budget = int(avail * 0.75) - 32 * H * W * 6           # 출력 버퍼(16bit, 최대 32장) 제외
+        workers = max(2, min(workers, budget // per_worker))
+        print(f"[deband] {W}x{H} {n}f avail={avail / 2**30:.1f}GB -> workers={workers}")
+    except Exception:
+        pass
     done = 0
     try:
         with ThreadPool(workers) as pool:
